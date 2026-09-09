@@ -676,7 +676,7 @@ namespace mt
 				{
 					Grid_BT grid_bt;
 					grid_bt.Blk = dim3(natoms, 1, 1);
-					grid_bt.Thr = dim3(c_thrnxny, c_thrnxny, 1);
+					grid_bt.Thr = dim3(c_thrn_x, c_thrn_y, 1);
 
 					return grid_bt;
 				};

@@ -43,6 +43,13 @@
 #include <thrust/tuple.h>
 #include <thrust/execution_policy.h>
 
+// Read-only cache intrinsic: uses __ldg() on device, plain dereference on host
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+#define LDG(ptr) __ldg(ptr)
+#else
+#define LDG(ptr) (*(ptr))
+#endif
+
 namespace mt
 {
 	// E. J. Kirkland - Advanced computing in electron microscopy page: 10-13
@@ -1498,21 +1505,21 @@ namespace mt
 		int unrolledBinarySearch_c_nR(const T &x0, const T *x)
 		{
 			int i0 = 0, ie = c_nR-1;
-			int im = (i0 + ie)>>1; // divide by 2
-			if(x0 < x[im]) ie = im; else i0 = im; // 64
-			im = (i0 + ie)>>1; 	// divide by 2
-			if(x0 < x[im]) ie = im; else i0 = im; // 32
-			im = (i0 + ie)>>1; 	// divide by 2
-			if(x0 < x[im]) ie = im; else i0 = im; // 16
-			im = (i0 + ie)>>1; 	// divide by 2
-			if(x0 < x[im]) ie = im; else i0 = im; // 8
-			im = (i0 + ie)>>1; 	// divide by 2
-			if(x0 < x[im]) ie = im; else i0 = im; // 4
-			im = (i0 + ie)>>1; 	// divide by 2
-			if(x0 < x[im]) ie = im; else i0 = im; // 2
-			im = (i0 + ie)>>1; 	// divide by 2
-			if(x0 < x[im]) ie = im; else i0 = im; // 1
-	
+			int im = (i0 + ie)>>1;
+			if(x0 < LDG(&x[im])) ie = im; else i0 = im;
+			im = (i0 + ie)>>1;
+			if(x0 < LDG(&x[im])) ie = im; else i0 = im;
+			im = (i0 + ie)>>1;
+			if(x0 < LDG(&x[im])) ie = im; else i0 = im;
+			im = (i0 + ie)>>1;
+			if(x0 < LDG(&x[im])) ie = im; else i0 = im;
+			im = (i0 + ie)>>1;
+			if(x0 < LDG(&x[im])) ie = im; else i0 = im;
+			im = (i0 + ie)>>1;
+			if(x0 < LDG(&x[im])) ie = im; else i0 = im;
+			im = (i0 + ie)>>1;
+			if(x0 < LDG(&x[im])) ie = im; else i0 = im;
+
 			return i0;
 		}
 
@@ -1543,11 +1550,11 @@ namespace mt
 		DEVICE_CALLABLE FORCE_INLINE 
 		void cubic_poly_coef(const int &iR, TAtom &atom)
 		{
-			auto idR = 1.0/(atom.R2[iR+1]-atom.R2[iR]);
-			auto V = atom.c0[iR]; 
-			auto Vn = atom.c0[iR+1];
-			auto dV = atom.c1[iR]; 
-			auto dVn = atom.c1[iR+1];
+			auto idR = 1.0/(LDG(&atom.R2[iR+1])-LDG(&atom.R2[iR]));
+			auto V = LDG(&atom.c0[iR]);
+			auto Vn = LDG(&atom.c0[iR+1]);
+			auto dV = LDG(&atom.c1[iR]);
+			auto dVn = LDG(&atom.c1[iR+1]);
 			auto m = (Vn-V)*idR; 
 			auto n = dV+dVn;
 			atom.c2[iR] = (3.0*m-n-dV)*idR;
@@ -1561,8 +1568,8 @@ namespace mt
 		{
 			const int ix = unrolledBinarySearch_c_nR<T>(R2, atom.R2);
 
-			const T dx = R2 - atom.R2[ix]; 
-			return (((atom.c3[ix]*dx + atom.c2[ix])*dx + atom.c1[ix])*dx + atom.c0[ix]);
+			const T dx = R2 - LDG(&atom.R2[ix]);
+			return (((LDG(&atom.c3[ix])*dx + LDG(&atom.c2[ix]))*dx + LDG(&atom.c1[ix]))*dx + LDG(&atom.c0[ix]));
 		}
 
 		template <class TGrid, class TVector>

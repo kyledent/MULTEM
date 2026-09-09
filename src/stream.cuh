@@ -164,6 +164,22 @@ namespace mt
 					return;
 				}
 
+#ifdef MULTEM_USE_OPENMP
+				// OpenMP: parallelize over the full 2D grid directly
+				// Only use OpenMP when grid is large enough to justify overhead
+				if (nx * ny >= 4096) {
+					#pragma omp parallel for collapse(2) schedule(static)
+					for(int ix = 0; ix < nx; ix++)
+					{
+						for(int iy = 0; iy < ny; iy++)
+						{
+							fn(ix, iy, arg...);
+						}
+					}
+					return;
+				}
+#endif
+				// Fall through to serial std::thread path for small grids or non-OpenMP
 				auto thr_fn_m = [&](const Range_2d &range, TArgs &...arg)
 				{
 					for(auto ix = range.ix_0; ix < range.ix_e; ix++)
@@ -193,6 +209,14 @@ namespace mt
 					return;
 				}
 
+#ifdef MULTEM_USE_OPENMP
+				// OpenMP: parallelize over the flat index directly
+				#pragma omp parallel for schedule(static)
+				for(int ixy = 0; ixy < nxy; ixy++)
+				{
+					fn(ixy, arg...);
+				}
+#else
 				auto thr_fn_v = [&](const Range_2d &range, TArgs &...arg)
 				{
 					for(auto ixy = range.ixy_0; ixy < range.ixy_e; ixy++)
@@ -209,6 +233,7 @@ namespace mt
 				thr_fn_v(get_range(n_act_stream-1), std::ref<TArgs>(arg)...);
 
 				synchronize();
+#endif
 			}
 
 			int n_act_stream;
@@ -239,6 +264,7 @@ namespace mt
 			};
 	};
 
+#ifndef MULTEM_NO_CUDA
 	template <>
 	struct Stream<e_device>
 	{
@@ -299,7 +325,7 @@ namespace mt
 			Range_2d get_range(const int &istream)
 			{
 				Range_2d range;
-				
+
 				int qnxy = nxy/n_act_stream;
 				range.ixy_0 = istream*qnxy;
 				range.ixy_e = (istream+1)*qnxy;
@@ -351,6 +377,16 @@ namespace mt
 				}
 			}
 	};
+#endif
+
+#ifdef MULTEM_NO_CUDA
+	template <>
+	struct Stream<e_device> : public Stream<e_host>
+	{
+		static const eDevice device = e_device;
+		using Stream<e_host>::Stream;
+	};
+#endif
 } // namespace mt
 
 #endif

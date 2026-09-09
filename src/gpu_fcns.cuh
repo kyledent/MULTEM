@@ -37,51 +37,8 @@
 #include "cgpu_fcns.cuh"
 #include "cpu_fcns.hpp"
 
-#define reduce_array_256(tid, sum, Mshare)						\
-	{															\
-		Mshare[tid] = sum;										\
-		__syncthreads();										\
-		if(tid < 128)											\
-		{														\
-			Mshare[tid] = sum = sum + Mshare[tid + 128];		\
-		}														\
-		__syncthreads();										\
-		if(tid < 64)											\
-		{														\
-			Mshare[tid] = sum = sum + Mshare[tid + 64];			\
-		}														\
-		__syncthreads();										\
-		if(tid < 32)											\
-		{														\
-			Mshare[tid] = sum = sum + Mshare[tid + 32];			\
-		}														\
-		__syncthreads();										\
-		if(tid < 16)											\
-		{														\
-			Mshare[tid] = sum = sum + Mshare[tid + 16];			\
-		}														\
-		__syncthreads();										\
-		if(tid < 8)												\
-		{														\
-			Mshare[tid] = sum = sum + Mshare[tid + 8];			\
-		}														\
-		__syncthreads();										\
-		if(tid < 4)												\
-		{														\
-			Mshare[tid] = sum = sum + Mshare[tid + 4];			\
-		}														\
-		__syncthreads();										\
-		if(tid < 2)												\
-		{														\
-			Mshare[tid] = sum = sum + Mshare[tid + 2];			\
-		}														\
-		__syncthreads();										\
-		if(tid < 1)												\
-		{														\
-			Mshare[tid] = sum = sum + Mshare[tid + 1];			\
-		}														\
-		__syncthreads();										\
-	}
+#include <cub/block/block_reduce.cuh>
+#include <cub/device/device_scan.cuh>
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
 #else
@@ -103,15 +60,15 @@
 
 namespace mt
 {
+#ifdef __CUDACC__
 	namespace device_detail
 	{
 		// modify
 		template <class T>
 		__global__ void atom_cost_function(Grid_2d<T> grid_2d, Atom_Sa<T> atom_Ip, rVector<T> M_i, rVector<T> Mp_o)
-		{ 
-			__shared__ T Mshare[c_thrnxny*c_thrnxny];
-
-			int tid = threadIdx.x + threadIdx.y*blockDim.x;
+		{
+			using BlockReduceT = cub::BlockReduce<T, c_nthreads_2d>;
+			__shared__ typename BlockReduceT::TempStorage temp_storage;
 
 			T sum = 0;
 
@@ -136,11 +93,11 @@ namespace mt
 				}
 				ix_0 += blockDim.y*gridDim.y;
 			}
-			reduce_array_256(tid, sum, Mshare);
+			sum = BlockReduceT(temp_storage).Sum(sum);
 
-			if(tid == 0)
+			if(threadIdx.x == 0 && threadIdx.y == 0)
 			{
-				Mp_o[tid] = sum;
+				Mp_o[0] = sum;
 			}
 		}
 
@@ -314,8 +271,207 @@ namespace mt
 			}
 		}
 
+		// ── Tiled potential accumulation ──────────────────
+		// Reduces atomicAdd contention by binning atoms to output-space
+		// tiles and accumulating in shared memory.  Three-step pipeline:
+		//   1. tile_count_atoms   – count atom-tile overlaps
+		//   2. tile_scatter_atoms – build per-tile atom lists (CSR)
+		//   3. eval_cubic_poly_tiled – shared-mem accumulation per tile
+
+		static constexpr int c_tile_w = 16;
+		static constexpr int c_tile_h = 16;
+
+		// Map atom-space ix to output-space ox via PBC + FFT shift.
+		// Assumes Rx_0 == 0 (default), so PBC is simple modular arithmetic.
+		template <class T>
+		__device__ __forceinline__
+		int atom_to_output_x(int ix, const Grid_2d<T> &g)
+		{
+			int px = ((ix % g.nx) + g.nx) % g.nx;       // PBC
+			return (px < g.nxh) ? px + g.nxh : px - g.nxh; // FFT shift
+		}
+
+		template <class T>
+		__device__ __forceinline__
+		int atom_to_output_y(int iy, const Grid_2d<T> &g)
+		{
+			int py = ((iy % g.ny) + g.ny) % g.ny;
+			return (py < g.nyh) ? py + g.nyh : py - g.nyh;
+		}
+
+		// Step 1: Count how many atoms overlap each output tile.
+		// One thread per atom; atomicAdd to tile_counts[tile_idx].
+		template <class T>
+		__global__ void tile_count_atoms(Grid_2d<T> grid_2d,
+			const Atom_Vp<T> *atoms, int n_atoms,
+			int n_tiles_x, int n_tiles_y, int *tile_counts)
+		{
+			int idx = blockIdx.x * blockDim.x + threadIdx.x;
+			if (idx >= n_atoms) return;
+
+			auto atom = atoms[idx];
+
+			// Output-space bounding box corners
+			int ox0 = atom_to_output_x(atom.ix_0, grid_2d);
+			int ox1 = atom_to_output_x(atom.ix_0 + atom.nx - 1, grid_2d);
+			int oy0 = atom_to_output_y(atom.iy_0, grid_2d);
+			int oy1 = atom_to_output_y(atom.iy_0 + atom.ny - 1, grid_2d);
+
+			// Tile ranges (handle PBC wrap: ox0 > ox1 means wrap-around)
+			int tx_lo[2], tx_hi[2], n_tx = 1;
+			if (ox0 <= ox1) {
+				tx_lo[0] = ox0 / c_tile_w;  tx_hi[0] = ox1 / c_tile_w;
+			} else {
+				tx_lo[0] = ox0 / c_tile_w;  tx_hi[0] = (grid_2d.nx - 1) / c_tile_w;
+				tx_lo[1] = 0;               tx_hi[1] = ox1 / c_tile_w;
+				n_tx = 2;
+			}
+
+			int ty_lo[2], ty_hi[2], n_ty = 1;
+			if (oy0 <= oy1) {
+				ty_lo[0] = oy0 / c_tile_h;  ty_hi[0] = oy1 / c_tile_h;
+			} else {
+				ty_lo[0] = oy0 / c_tile_h;  ty_hi[0] = (grid_2d.ny - 1) / c_tile_h;
+				ty_lo[1] = 0;               ty_hi[1] = oy1 / c_tile_h;
+				n_ty = 2;
+			}
+
+			for (int ri = 0; ri < n_tx; ri++)
+				for (int rj = 0; rj < n_ty; rj++)
+					for (int tx = tx_lo[ri]; tx <= tx_hi[ri]; tx++)
+						for (int ty = ty_lo[rj]; ty <= ty_hi[rj]; ty++)
+							atomicAdd(&tile_counts[tx * n_tiles_y + ty], 1);
+		}
+
+		// Step 2: Scatter atom indices into per-tile CSR lists.
+		// Same tile-overlap logic as tile_count_atoms; writes into
+		// atom_tile_indices[tile_offsets[tile] + write_pos].
+		template <class T>
+		__global__ void tile_scatter_atoms(Grid_2d<T> grid_2d,
+			const Atom_Vp<T> *atoms, int n_atoms,
+			int n_tiles_x, int n_tiles_y,
+			const int *tile_offsets, int *tile_write_pos,
+			int *atom_tile_indices)
+		{
+			int idx = blockIdx.x * blockDim.x + threadIdx.x;
+			if (idx >= n_atoms) return;
+
+			auto atom = atoms[idx];
+
+			int ox0 = atom_to_output_x(atom.ix_0, grid_2d);
+			int ox1 = atom_to_output_x(atom.ix_0 + atom.nx - 1, grid_2d);
+			int oy0 = atom_to_output_y(atom.iy_0, grid_2d);
+			int oy1 = atom_to_output_y(atom.iy_0 + atom.ny - 1, grid_2d);
+
+			int tx_lo[2], tx_hi[2], n_tx = 1;
+			if (ox0 <= ox1) {
+				tx_lo[0] = ox0 / c_tile_w;  tx_hi[0] = ox1 / c_tile_w;
+			} else {
+				tx_lo[0] = ox0 / c_tile_w;  tx_hi[0] = (grid_2d.nx - 1) / c_tile_w;
+				tx_lo[1] = 0;               tx_hi[1] = ox1 / c_tile_w;
+				n_tx = 2;
+			}
+
+			int ty_lo[2], ty_hi[2], n_ty = 1;
+			if (oy0 <= oy1) {
+				ty_lo[0] = oy0 / c_tile_h;  ty_hi[0] = oy1 / c_tile_h;
+			} else {
+				ty_lo[0] = oy0 / c_tile_h;  ty_hi[0] = (grid_2d.ny - 1) / c_tile_h;
+				ty_lo[1] = 0;               ty_hi[1] = oy1 / c_tile_h;
+				n_ty = 2;
+			}
+
+			for (int ri = 0; ri < n_tx; ri++)
+				for (int rj = 0; rj < n_ty; rj++)
+					for (int tx = tx_lo[ri]; tx <= tx_hi[ri]; tx++)
+						for (int ty = ty_lo[rj]; ty <= ty_hi[rj]; ty++)
+						{
+							int tile_idx = tx * n_tiles_y + ty;
+							int pos = atomicAdd(&tile_write_pos[tile_idx], 1);
+							atom_tile_indices[tile_offsets[tile_idx] + pos] = idx;
+						}
+		}
+
+		// Step 3: Tiled potential accumulation.
+		// One block per output tile (c_tile_w × c_tile_h threads).
+		// Each thread owns one output pixel, accumulates contributions
+		// from all atoms assigned to this tile in shared memory, then
+		// writes once to global (no atomicAdd on M_o).
+		template <class T>
+		__global__ void eval_cubic_poly_tiled(Grid_2d<T> grid_2d,
+			const Atom_Vp<T> *atoms,
+			int n_tiles_y, const int *tile_offsets,
+			const int *atom_tile_indices, rVector<T> M_o)
+		{
+			__shared__ T smem[c_tile_w * c_tile_h];
+
+			int tile_idx = blockIdx.x;
+			int tx = tile_idx / n_tiles_y;
+			int ty = tile_idx % n_tiles_y;
+
+			// Output pixel owned by this thread
+			int local_x = threadIdx.y;   // [0, c_tile_w)  → output x (row)
+			int local_y = threadIdx.x;   // [0, c_tile_h)  → output y (col)
+			int ox = tx * c_tile_w + local_x;
+			int oy = ty * c_tile_h + local_y;
+
+			int smem_idx = local_x * c_tile_h + local_y;
+			smem[smem_idx] = T(0);
+
+			bool valid = (ox < grid_2d.nx && oy < grid_2d.ny);
+
+			// Reverse FFT shift: shift is self-inverse
+			int px = valid ? ((ox < grid_2d.nxh) ? ox + grid_2d.nxh : ox - grid_2d.nxh) : 0;
+			int py = valid ? ((oy < grid_2d.nyh) ? oy + grid_2d.nyh : oy - grid_2d.nyh) : 0;
+
+			__syncthreads();
+
+			// Process atoms assigned to this tile
+			int a_start = tile_offsets[tile_idx];
+			int a_end   = tile_offsets[tile_idx + 1];
+
+			for (int ai = a_start; ai < a_end; ai++)
+			{
+				if (!valid) continue;
+
+				auto atom = atoms[atom_tile_indices[ai]];
+
+				// Check if this PBC-space pixel is in atom's footprint.
+				// Atom covers [ix_0, ix_0+nx_a) in atom coords; after PBC
+				// this is nx_a consecutive values starting at
+				// s = ((ix_0 % grid.nx) + grid.nx) % grid.nx.
+				// Pixel px is inside iff (px - s + grid.nx) % grid.nx < nx_a.
+				int sx = ((atom.ix_0 % grid_2d.nx) + grid_2d.nx) % grid_2d.nx;
+				int sy = ((atom.iy_0 % grid_2d.ny) + grid_2d.ny) % grid_2d.ny;
+				int dx = (px - sx + grid_2d.nx) % grid_2d.nx;
+				int dy = (py - sy + grid_2d.ny) % grid_2d.ny;
+
+				if (dx < atom.nx && dy < atom.ny)
+				{
+					// Reconstruct atom-space coords for R2 computation
+					int ix = atom.ix_0 + dx;
+					int iy = atom.iy_0 + dy;
+					const auto R2 = grid_2d.R2(ix, iy, atom.x, atom.y);
+
+					if (R2 < atom.R2_max)
+					{
+						const T V = atom.occ * host_device_detail::eval_cubic_poly(R2, atom);
+						smem[smem_idx] += V;
+					}
+				}
+			}
+
+			__syncthreads();
+
+			// Write accumulated value to global output (single write, no atomicAdd)
+			if (valid)
+			{
+				M_o.V[ox * grid_2d.ny + oy] = smem[smem_idx];
+			}
+		}
+
 		// Gaussian evaluation
-		template <class T> 
+		template <class T>
 		__global__ void gauss_eval(Grid_2d<T> grid_2d, rVector<Gauss_Sp<T>> atoms, rVector<T> M_o)
 		{
 			const auto gauss = atoms.V[blockIdx.x];
@@ -477,10 +633,10 @@ namespace mt
 		// sum over the detector
 		template <class TGrid, class T>
 		__global__ void sum_over_Det(TGrid grid_2d, Value_type<TGrid> g2_min, Value_type<TGrid> g2_max, rVector<T> M_i, rVector<T> Mp_o)
-		{ 
-			__shared__ T Mshare[c_thrnxny*c_thrnxny];
+		{
+			using BlockReduceT = cub::BlockReduce<T, c_nthreads_2d>;
+			__shared__ typename BlockReduceT::TempStorage temp_storage;
 
-			int tid = threadIdx.x + threadIdx.y*blockDim.x;
 			int bid = blockIdx.x + blockIdx.y*gridDim.x;
 
 			int iy_0 = threadIdx.x + blockIdx.x*blockDim.x;
@@ -499,9 +655,9 @@ namespace mt
 				}
 				ix += blockDim.y*gridDim.y;
 			}
-			reduce_array_256(tid, sum, Mshare);
+			sum = BlockReduceT(temp_storage).Sum(sum);
 
-			if(tid == 0)
+			if(threadIdx.x == 0 && threadIdx.y == 0)
 			{
 				Mp_o[bid] = sum;
 			}
@@ -510,12 +666,11 @@ namespace mt
 		// sum over the detector
 		template <class TGrid, class T>
 		__global__ void sum_square_over_Det(TGrid grid_2d, Value_type<TGrid> g2_min, Value_type<TGrid> g2_max, rVector<T> M_i, rVector<Value_type<TGrid>> Mp_o)
-		{ 
+		{
 			using T_r = Value_type<TGrid>;
+			using BlockReduceT = cub::BlockReduce<T_r, c_nthreads_2d>;
+			__shared__ typename BlockReduceT::TempStorage temp_storage;
 
-			__shared__ T_r Mshare[c_thrnxny*c_thrnxny];
-
-			int tid = threadIdx.x + threadIdx.y*blockDim.x;
 			int bid = blockIdx.x + blockIdx.y*gridDim.x;
 
 			int iy_0 = threadIdx.x + blockIdx.x*blockDim.x;
@@ -535,9 +690,9 @@ namespace mt
 				ix += blockDim.y*gridDim.y;
 			}
 
-			reduce_array_256(tid, sum, Mshare);
+			sum = BlockReduceT(temp_storage).Sum(sum);
 
-			if(tid == 0)
+			if(threadIdx.x == 0 && threadIdx.y == 0)
 			{
 				Mp_o[bid] = sum;
 			}
@@ -546,12 +701,11 @@ namespace mt
 		// sum over the detector
 		template <class TGrid, class T>
 		__global__ void sum_square_over_Det(TGrid grid_2d, rVector<Value_type<TGrid>> S_i, rVector<T> M_i, rVector<Value_type<TGrid>> Mp_o)
-		{ 
+		{
 			using T_r = Value_type<TGrid>;
+			using BlockReduceT = cub::BlockReduce<T_r, c_nthreads_2d>;
+			__shared__ typename BlockReduceT::TempStorage temp_storage;
 
-			__shared__ T_r Mshare[c_thrnxny*c_thrnxny];
-
-			int tid = threadIdx.x + threadIdx.y*blockDim.x;
 			int bid = blockIdx.x + blockIdx.y*gridDim.x;
 
 			int iy_0 = threadIdx.x + blockIdx.x*blockDim.x;
@@ -571,9 +725,9 @@ namespace mt
 				ix += blockDim.y*gridDim.y;
 			}
 
-			reduce_array_256(tid, sum, Mshare);
+			sum = BlockReduceT(temp_storage).Sum(sum);
 
-			if(tid == 0)
+			if(threadIdx.x == 0 && threadIdx.y == 0)
 			{
 				Mp_o[bid] = sum;
 			}
@@ -790,10 +944,10 @@ namespace mt
 		// sum over the detector
 		template <class T>
 		__global__ void norm_factor_lorentz(Grid_2d<T> grid_2d, T gc2, T ge2, rVector<T> Mp_o)
-		{ 
-			__shared__ T Mshare[c_thrnxny*c_thrnxny];
+		{
+			using BlockReduceT = cub::BlockReduce<T, c_nthreads_2d>;
+			__shared__ typename BlockReduceT::TempStorage temp_storage;
 
-			int tid = threadIdx.x + threadIdx.y*blockDim.x;
 			int bid = blockIdx.x + blockIdx.y*gridDim.x;
 
 			int iy_0 = threadIdx.x + blockIdx.x*blockDim.x;
@@ -813,9 +967,9 @@ namespace mt
 				ix += blockDim.y*gridDim.y;
 			}
 
-			reduce_array_256(tid, sum, Mshare);
+			sum = BlockReduceT(temp_storage).Sum(sum);
 
-			if(tid == 0)
+			if(threadIdx.x == 0 && threadIdx.y == 0)
 			{
 				Mp_o[bid] = sum;
 			}
@@ -824,9 +978,9 @@ namespace mt
 		template <class TGrid>
 		Value_type<TGrid> Lorentz_factor(Stream<e_device> &stream, TGrid &grid_2d, EELS<Value_type<TGrid>> &eels)
 		{
-			device_vector<Value_type<TGrid>> sum_v(c_thrnxny*c_thrnxny);
+			device_vector<Value_type<TGrid>> sum_v(c_nthreads_2d);
 
-			auto grid_bt = grid_2d.cuda_grid(dim3(c_thrnxny, c_thrnxny));
+			auto grid_bt = grid_2d.cuda_grid(dim3(c_thrn_x, c_thrn_y));
 
 			norm_factor_lorentz<Value_type<TGrid>><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, eels.gc2, eels.ge2, sum_v);
 
@@ -1140,6 +1294,26 @@ namespace mt
 			}
 		}
 
+		// Fused transmission function + multiply kernel.
+		// Combines psi[i] = psi[i] * trans(V0[i]) into a single kernel,
+		// eliminating the trans_0 intermediate buffer and one kernel launch.
+		// Only used when bandwidth limiting (BWL) is disabled.
+		template <class T>
+		__global__ void fused_transmit_multiply(
+			int nxy, T w, eElec_Spec_Int_Model model,
+			const T* __restrict__ V0, complex<T>* __restrict__ psi)
+		{
+			int tid = threadIdx.x + blockIdx.x * blockDim.x;
+			if (tid < nxy)
+			{
+				T theta = w * V0[tid];
+				complex<T> t = (model == eESIM_Weak_Phase_Object)
+					? complex<T>(T(1), theta)
+					: euler(theta);
+				psi[tid] = psi[tid] * t;
+			}
+		}
+
 	} // namespace device_detail
 
 	template <class TVector_1, class TVector_2>
@@ -1320,17 +1494,17 @@ namespace mt
 	enable_if_device_vector<TVector_c, void>
 	exp_r_factor_1d(TGrid &grid_1d, Value_type<TGrid> gx, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_1d.cuda_grid();
+		auto grid_bt = optimal_grid_1d(device_detail::exp_r_factor_1d<TGrid, typename TVector_c::value_type>, grid_1d.nx);
 
 		device_detail::exp_r_factor_1d<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_1d, gx, fPsi_i, fPsi_o);
 	}
 
 	template <class TGrid, class TVector_r, class TVector_c>
 	enable_if_device_vector<TVector_c, void>
-	exp_r_factor_2d_bc(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> alpha, 
+	exp_r_factor_2d_bc(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> alpha,
 	TVector_r &gy, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::exp_r_factor_2d_bc<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::exp_r_factor_2d_bc<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, alpha, gy, fPsi_i, fPsi_o);
 	}
@@ -1339,17 +1513,17 @@ namespace mt
 	enable_if_device_vector<TVector_c, void>
 	exp_r_factor_2d(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> gx, Value_type<TGrid> gy, TVector_c &fPsi_i, TVector_c &fPsi_o, bool scaling=true)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::exp_r_factor_2d<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::exp_r_factor_2d<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, gx, gy, fPsi_i, fPsi_o, scaling);
 	}
 
 	template <class TGrid, class TVector_c>
 	enable_if_device_vector<TVector_c, void>
-	mul_exp_r_factor_2d(Stream<e_device> &stream, TGrid &grid_2d, Vector<Value_type<TGrid>, e_host> &gxh, 
+	mul_exp_r_factor_2d(Stream<e_device> &stream, TGrid &grid_2d, Vector<Value_type<TGrid>, e_host> &gxh,
 	Vector<Value_type<TGrid>, e_host> &gyh, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::mul_exp_r_factor_2d<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		Vector<Value_type<TGrid>, e_device> gx = gxh;
 		Vector<Value_type<TGrid>, e_device> gy = gyh;
@@ -1361,17 +1535,17 @@ namespace mt
 	enable_if_device_vector<TVector_c, void>
 	exp_g_factor_1d(TGrid &grid_1d, Value_type<TGrid> x, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_1d.cuda_grid();
+		auto grid_bt = optimal_grid_1d(device_detail::exp_g_factor_1d<TGrid, typename TVector_c::value_type>, grid_1d.nx);
 
 		device_detail::exp_g_factor_1d<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_1d, x, fPsi_i, fPsi_o);
 	}
 
 	template <class TGrid, class TVector_r, class TVector_c>
 	enable_if_device_vector<TVector_c, void>
-	exp_g_factor_2d_bc(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> alpha, 
+	exp_g_factor_2d_bc(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> alpha,
 	TVector_r &y, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::exp_g_factor_2d_bc<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::exp_g_factor_2d_bc<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, alpha, y, fPsi_i, fPsi_o);
 	}
@@ -1380,17 +1554,17 @@ namespace mt
 	enable_if_device_vector<TVector_c, void>
 	exp_g_factor_2d(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> x, Value_type<TGrid> y, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::exp_g_factor_2d<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::exp_g_factor_2d<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, x, y, fPsi_i, fPsi_o);
 	}
 
 	template <class TGrid, class TVector_c>
 	enable_if_device_vector<TVector_c, void>
-	mul_exp_g_factor_2d(Stream<e_device> &stream, TGrid &grid_2d, Vector<Value_type<TGrid>, e_host> &xh, 
+	mul_exp_g_factor_2d(Stream<e_device> &stream, TGrid &grid_2d, Vector<Value_type<TGrid>, e_host> &xh,
 	Vector<Value_type<TGrid>, e_host> &yh, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::mul_exp_g_factor_2d<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		Vector<Value_type<TGrid>, e_device> x = xh;
 		Vector<Value_type<TGrid>, e_device> y = yh;
@@ -1406,7 +1580,7 @@ namespace mt
 
 		Grid_BT grid_bt;
 		grid_bt.Blk = dim3();
-		grid_bt.Thr = dim3(c_thrnxny, c_thrnxny);
+		grid_bt.Thr = dim3(c_thrn_x, c_thrn_y);
 
 		device_detail::atom_cost_function<typename TVector_r::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, atom_Ip, M_i, sum_v);
 		return sum_v[0];
@@ -1425,7 +1599,7 @@ namespace mt
 		{
 			Grid_BT grid_bt;
 			grid_bt.Blk = dim3();
-			grid_bt.Thr = dim3(c_thrnxny, c_thrnxny);
+			grid_bt.Thr = dim3(c_thrn_x, c_thrn_y);
 
 			device_detail::subtract_atom<typename TVector_r::value_type><<<grid_bt.Blk, grid_bt.Thr, 0, stream[istream]>>>(grid_2d, atom_Ip[istream], M_i);
 		}
@@ -1523,7 +1697,7 @@ namespace mt
 	enable_if_device_vector<TVector, void>
 	fft1_shift(TGrid &grid_1d, TVector &M_io)
 	{
-		auto grid_bt = grid_1d.cuda_grid_h();
+		auto grid_bt = optimal_grid_1d(device_detail::fft1_shift<TGrid, typename TVector::value_type>, grid_1d.nxh);
 
 		device_detail::fft1_shift<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_1d, M_io); 	
 	}
@@ -1532,7 +1706,7 @@ namespace mt
 	enable_if_device_vector<TVector, void>
 	fft2_sft_bc(Stream<e_device> &stream, TGrid &grid_2d, TVector &M_io)
 	{
-		auto grid_bt = grid_2d.cuda_grid(dim3((grid_2d.nyh+c_thrnxny-1)/c_thrnxny, (grid_2d.nx+c_thrnxny-1)/c_thrnxny));
+		auto grid_bt = grid_2d.cuda_grid(dim3((grid_2d.nyh+c_thrn_x-1)/c_thrn_x, (grid_2d.nx+c_thrn_y-1)/c_thrn_y));
 
 		device_detail::fft2_sft_bc<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, M_io); 	
 	}
@@ -1541,7 +1715,7 @@ namespace mt
 	enable_if_device_vector<TVector, void>
 	fft2_shift(Stream<e_device> &stream, TGrid &grid_2d, TVector &M_io)
 	{
-		auto grid_bt = grid_2d.cuda_grid_h();
+		auto grid_bt = optimal_grid_2d(device_detail::fft2_shift<TGrid, typename TVector::value_type>, grid_2d.nyh, grid_2d.nxh);
 
 		device_detail::fft2_shift<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, M_io); 	
 	}
@@ -1550,7 +1724,7 @@ namespace mt
 	enable_if_device_vector<TVector, void>
 	fft2_shift(TGrid &grid_2d, TVector &M_io)
 	{
-		auto grid_bt = grid_2d.cuda_grid_h();
+		auto grid_bt = optimal_grid_2d(device_detail::fft2_shift<TGrid, typename TVector::value_type>, grid_2d.nyh, grid_2d.nxh);
 
 		device_detail::fft2_shift<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, M_io); 	
 	}
@@ -1560,9 +1734,9 @@ namespace mt
 	enable_if_device_vector<TVector, Value_type<TVector>>
 	sum_over_Det(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> g_min, Value_type<TGrid> g_max, TVector &M_i)
 	{
-		TVector sum_v(c_thrnxny*c_thrnxny);
+		TVector sum_v(c_nthreads_2d);
 
-		auto grid_bt = grid_2d.cuda_grid(dim3(c_thrnxny, c_thrnxny));
+		auto grid_bt = grid_2d.cuda_grid(dim3(c_thrn_x, c_thrn_y));
 
 		device_detail::sum_over_Det<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, pow(g_min, 2), pow(g_max, 2), M_i, sum_v);
 		return mt::sum(stream, sum_v);
@@ -1572,9 +1746,9 @@ namespace mt
 	enable_if_device_vector<TVector, Value_type<TGrid>>
 	sum_square_over_Det(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> g_min, Value_type<TGrid> g_max, TVector &M_i)
 	{
-		device_vector<Value_type<TGrid>> sum_t(c_thrnxny*c_thrnxny, 0);
+		device_vector<Value_type<TGrid>> sum_t(c_nthreads_2d, 0);
 
-		auto grid_bt = grid_2d.cuda_grid(dim3(c_thrnxny, c_thrnxny));
+		auto grid_bt = grid_2d.cuda_grid(dim3(c_thrn_x, c_thrn_y));
 
 		device_detail::sum_square_over_Det<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, pow(g_min, 2), pow(g_max, 2), M_i, sum_t);
 		return sum(stream, sum_t);
@@ -1584,9 +1758,9 @@ namespace mt
 	enable_if_device_vector_and_device_vector<TVector_1, TVector_2, Value_type<TGrid>>
 	sum_square_over_Det(Stream<e_device> &stream, TGrid &grid_2d, TVector_1 &S_i, TVector_2 &M_i)
 	{
-		device_vector<Value_type<TGrid>> sum_t(c_thrnxny*c_thrnxny, 0);
+		device_vector<Value_type<TGrid>> sum_t(c_nthreads_2d, 0);
 
-		auto grid_bt = grid_2d.cuda_grid(dim3(c_thrnxny, c_thrnxny));
+		auto grid_bt = grid_2d.cuda_grid(dim3(c_thrn_x, c_thrn_y));
 
 		device_detail::sum_square_over_Det<TGrid, typename TVector_2::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, S_i, M_i, sum_t);
 		return sum(stream, sum_t);
@@ -1596,26 +1770,26 @@ namespace mt
 	enable_if_device_vector<TVector_c, void>
 	bandwidth_limit(Stream<e_device> &stream, TGrid &grid_2d, TVector_c &M_io)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::bandwidth_limit<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
-		device_detail::bandwidth_limit<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, M_io); 
+		device_detail::bandwidth_limit<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, M_io);
 	}
 
 	template <class TGrid, class TVector_c>
 	enable_if_device_vector<TVector_c, void>
 	hard_aperture(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> g_max, Value_type<TGrid> w, TVector_c &M_io)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::hard_aperture<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
-		device_detail::hard_aperture<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, pow(g_max, 2), w, M_io); 
+		device_detail::hard_aperture<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, pow(g_max, 2), w, M_io);
 	}
 
 	template <class TGrid, class TVector_c>
 	enable_if_device_vector<TVector_c, void>
-	propagate(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> w, 
+	propagate(Stream<e_device> &stream, TGrid &grid_2d, Value_type<TGrid> w,
 	Value_type<TGrid> gxu, Value_type<TGrid> gyu, TVector_c &psi_i, TVector_c &psi_o)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::propagate<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 		device_detail::propagate<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, w, gxu, gyu, psi_i, psi_o);
 	}
 
@@ -1630,14 +1804,39 @@ namespace mt
 		functor::transmission_function<T_r>(w, elec_spec_int_model));
 	}
 
+	// Fused transmission + multiply dispatch.
+	// psi[i] *= trans(w * V0[i]) in a single kernel, avoiding the
+	// intermediate trans_0 buffer. Only valid when BWL is disabled.
+	template <class TGrid, class TVector_r, class TVector_c>
+	enable_if_device_vector_and_device_vector<TVector_r, TVector_c, void>
+	fused_transmit_multiply(Stream<e_device> &stream, TGrid &grid_2d,
+	eElec_Spec_Int_Model elec_spec_int_model, Value_type<TGrid> w,
+	TVector_r &V0_i, TVector_c &psi_io)
+	{
+		using T_r = Value_type<TGrid>;
+		const int nxy = grid_2d.nxy();
+		const int block_size = 256;
+		const int grid_size = (nxy + block_size - 1) / block_size;
+		device_detail::fused_transmit_multiply<T_r><<<grid_size, block_size>>>(
+			nxy, w, elec_spec_int_model,
+			raw_pointer_cast(V0_i.data()),
+			raw_pointer_cast(psi_io.data()));
+	}
+
+	// Host no-op overload — fused kernel is GPU-only.
+	// Required so that the template compiles for dev=e_host instantiations.
+	template <class TGrid, class TVector_r, class TVector_c>
+	void fused_transmit_multiply(Stream<e_host> &, TGrid &, eElec_Spec_Int_Model,
+	Value_type<TGrid>, TVector_r &, TVector_c &) {}
+
 	template <class TGrid, class TVector_c>
 	enable_if_device_vector<TVector_c, void>
-	probe(Stream<e_device> &stream, TGrid &grid_2d, Lens<Value_type<TGrid>> &lens, Value_type<TGrid> x, 
+	probe(Stream<e_device> &stream, TGrid &grid_2d, Lens<Value_type<TGrid>> &lens, Value_type<TGrid> x,
 	Value_type<TGrid> y, Value_type<TGrid> gxu, Value_type<TGrid> gyu, TVector_c &fPsi_o)
 	{
 		using T_r = Value_type<TGrid>;
 
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::probe<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::probe<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, lens, x, y, gxu, gyu, fPsi_o);
 
@@ -1649,7 +1848,7 @@ namespace mt
 	enable_if_device_vector<TVector_c, void>
 	apply_CTF(Stream<e_device> &stream, TGrid &grid_2d, Lens<Value_type<TGrid>> &lens, Value_type<TGrid> gxu, Value_type<TGrid> gyu, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::apply_CTF<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 		device_detail::apply_CTF<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, lens, gxu, gyu, fPsi_i, fPsi_o);
 	}
 
@@ -1657,7 +1856,7 @@ namespace mt
 	enable_if_device_vector<TVector_c, void>
 	apply_PCTF(Stream<e_device> &stream, TGrid &grid_2d, Lens<Value_type<TGrid>> &lens, TVector_c &fPsi_i, TVector_c &fPsi_o)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::apply_PCTF<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 		device_detail::apply_PCTF<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, lens, fPsi_i, fPsi_o);
 	}
 
@@ -1667,7 +1866,7 @@ namespace mt
 	{
 		eels.factor = device_detail::Lorentz_factor(stream, grid_2d, eels);
 
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::kernel_xyz<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::kernel_xyz<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, eels, k_x, k_y, k_z);
 
@@ -1682,7 +1881,7 @@ namespace mt
 	{
 		eels.factor = device_detail::Lorentz_factor(stream, grid_2d, eels);
 
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::kernel_x<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::kernel_x<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, eels, k_x);
 
@@ -1694,7 +1893,7 @@ namespace mt
 	{
 		eels.factor = device_detail::Lorentz_factor(stream, grid_2d, eels);
 
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::kernel_y<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::kernel_y<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, eels, k_y);
 
@@ -1707,7 +1906,7 @@ namespace mt
 	{
 		eels.factor = device_detail::Lorentz_factor(stream, grid_2d, eels);
 
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::kernel_z<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::kernel_z<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, eels, k_z);
 
@@ -1720,7 +1919,7 @@ namespace mt
 	{
 		eels.factor = device_detail::Lorentz_factor(stream, grid_2d, eels);
 
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::kernel_mn1<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::kernel_mn1<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, eels, k_mn1);
 
@@ -1733,7 +1932,7 @@ namespace mt
 	{
 		eels.factor = device_detail::Lorentz_factor(stream, grid_2d, eels);
 
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::kernel_mp1<TGrid, typename TVector_c::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::kernel_mp1<TGrid, typename TVector_c::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, eels, k_mp1);
 
@@ -1815,70 +2014,70 @@ namespace mt
 	/***************************************************************************/
  	template <class TGrid, class TVector>
 	enable_if_device_vector<TVector, void>
-	assign_shift_2d(TGrid &grid_2d, TVector &M_i, TVector &M_o, 
+	assign_shift_2d(TGrid &grid_2d, TVector &M_i, TVector &M_o,
 	Vector<Value_type<TVector>, e_host> *M_i_h = nullptr)
 	{
-		auto grid_bt = grid_2d.cuda_grid_h();
+		auto grid_bt = optimal_grid_2d(device_detail::assign_shift_2d<TGrid, typename TVector::value_type>, grid_2d.nyh, grid_2d.nxh);
 
 		device_detail::assign_shift_2d<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, M_i, M_o); 	
 	}
 
   	template <class TGrid, class TVector>
 	enable_if_device_vector<TVector, void>
-	add_scale_shift_2d(TGrid &grid_2d, Value_type<TVector> w, 
+	add_scale_shift_2d(TGrid &grid_2d, Value_type<TVector> w,
 	TVector &M_i, TVector &M_o, Vector<Value_type<TVector>, e_host> *M_i_h = nullptr)
 	{
-		auto grid_bt = grid_2d.cuda_grid_h();
+		auto grid_bt = optimal_grid_2d(device_detail::add_scale_shift_2d<TGrid, typename TVector::value_type>, grid_2d.nyh, grid_2d.nxh);
 
 		device_detail::add_scale_shift_2d<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, w, M_i, M_o); 	
 	}
  
   	template <class TGrid, class TVector_1, class TVector_2>
 	enable_if_device_vector_and_device_vector<TVector_1, TVector_2, void>
-	add_scale_square_shift_2d(TGrid &grid_2d, Value_type<TGrid> w, 
+	add_scale_square_shift_2d(TGrid &grid_2d, Value_type<TGrid> w,
 	TVector_1 &M_i, TVector_2 &M_o, Vector<Value_type<TVector_1>, e_host> *M_i_h = nullptr)
 	{
-		auto grid_bt = grid_2d.cuda_grid_h();
+		auto grid_bt = optimal_grid_2d(device_detail::add_scale_square_shift_2d<TGrid, typename TVector_1::value_type, typename TVector_2::value_type>, grid_2d.nyh, grid_2d.nxh);
 
 		device_detail::add_scale_square_shift_2d<TGrid, typename TVector_1::value_type, typename TVector_2::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, w, M_i, M_o); 	
 	}
 
   	template <class TGrid, class TVector>
 	enable_if_device_vector<TVector, void>
-	assign_crop(TGrid &grid_2d, TVector &M_i, Range_2d &range, 
+	assign_crop(TGrid &grid_2d, TVector &M_i, Range_2d &range,
 	TVector &M_o, Vector<Value_type<TVector>, e_host> *M_i_h = nullptr)
 	{
-		auto grid_bt = grid_2d.cuda_grid();
+		auto grid_bt = optimal_grid_2d(device_detail::assign_crop_shift_2d<TGrid, typename TVector::value_type>, grid_2d.ny, grid_2d.nx);
 
 		device_detail::assign_crop_shift_2d<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, M_i, range, M_o); 	
 	}
 
  	template <class TGrid, class TVector>
 	enable_if_device_vector<TVector, void>
-	assign_crop_shift_2d(TGrid &grid_2d, TVector &M_i, Range_2d &range, 
+	assign_crop_shift_2d(TGrid &grid_2d, TVector &M_i, Range_2d &range,
 	TVector &M_o, Vector<Value_type<TVector>, e_host> *M_i_h = nullptr)
 	{
-		auto grid_bt = grid_2d.cuda_grid_h();
+		auto grid_bt = optimal_grid_2d(device_detail::assign_crop_shift_2d<TGrid, typename TVector::value_type>, grid_2d.nyh, grid_2d.nxh);
 
 		device_detail::assign_crop_shift_2d<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, M_i, range, M_o); 	
 	}
 
   	template <class TGrid, class TVector>
 	enable_if_device_vector<TVector, void>
-	add_scale_crop_shift_2d(TGrid &grid_2d, Value_type<TVector> w, 
+	add_scale_crop_shift_2d(TGrid &grid_2d, Value_type<TVector> w,
 	TVector &M_i, Range_2d &range, TVector &M_o, Vector<Value_type<TVector>, e_host> *M_i_h = nullptr)
 	{
-		auto grid_bt = grid_2d.cuda_grid_h();
+		auto grid_bt = optimal_grid_2d(device_detail::add_scale_crop_shift_2d<TGrid, typename TVector::value_type>, grid_2d.nyh, grid_2d.nxh);
 
 		device_detail::add_scale_crop_shift_2d<TGrid, typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, w, M_i, range, M_o); 	
 	}
  
   	template <class TGrid, class TVector_1, class TVector_2>
 	enable_if_device_vector_and_device_vector<TVector_1, TVector_2, void>
-	add_scale_square_crop_shift_2d(TGrid &grid_2d, Value_type<TGrid> w, 
+	add_scale_square_crop_shift_2d(TGrid &grid_2d, Value_type<TGrid> w,
 	TVector_1 &M_i, Range_2d &range, TVector_2 &M_o, Vector<Value_type<TVector_1>, e_host> *M_i_h = nullptr)
 	{
-		auto grid_bt = grid_2d.cuda_grid_h();
+		auto grid_bt = optimal_grid_2d(device_detail::add_scale_square_crop_shift_2d<TGrid, typename TVector_1::value_type, typename TVector_2::value_type>, grid_2d.nyh, grid_2d.nxh);
 
 		device_detail::add_scale_square_crop_shift_2d<TGrid, typename TVector_1::value_type, typename TVector_2::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(grid_2d, w, M_i, range, M_o); 	
 	}
@@ -2092,20 +2291,22 @@ namespace mt
 	trs(Stream<e_device> &stream, const int &nrows, const int &ncols, TVector &M)
 	{
 		Grid_BT grid_bt;
-		grid_bt.Blk = dim3((nrows+c_thrnxny-1)/c_thrnxny, (ncols+c_thrnxny-1)/c_thrnxny);
-		grid_bt.Thr = dim3(c_thrnxny, c_thrnxny);
+		grid_bt.Blk = dim3((nrows+c_thrn_x-1)/c_thrn_x, (ncols+c_thrn_y-1)/c_thrn_y);
+		grid_bt.Thr = dim3(c_thrn_x, c_thrn_y);
 
 		TVector M_t(nrows*ncols);
 		device_detail::trs<typename TVector::value_type><<<grid_bt.Blk, grid_bt.Thr>>>(ncols, nrows, M, M_t);
 		M = M_t;
 	}
 
+#endif // __CUDACC__ -- end of GPU-only device_detail + e_device overloads
 
+#ifdef __CUDACC__
 	/*******************************************************************/
-	// find peak position 1d
+	// find peak position 1d (device_vector overload)
 	template <class TGrid, class TVector>
 	enable_if_device_vector<TVector, Value_type<TVector>>
-	fit_max_pos_1d(TGrid &grid_1d, TVector &Im, Value_type<TVector> p_i, 
+	fit_max_pos_1d(TGrid &grid_1d, TVector &Im, Value_type<TVector> p_i,
 	Value_type<TVector> sigma_i, Value_type<TVector> radius_i)
 	{
 		using T = Value_type<TVector>;
@@ -2114,10 +2315,10 @@ namespace mt
 		return fit_max_pos_1d(grid_1d, Im_h, p_i, sigma_i, radius_i);
 	}
 
-	// find peak position 2d
+	// find peak position 2d (device_vector overload)
 	template <class TGrid, class TVector>
 	enable_if_device_vector<TVector, r2d<Value_type<TVector>>>
-	fit_max_pos_2d(TGrid &grid_2d, TVector &Im, r2d<Value_type<TVector>> p_i, 
+	fit_max_pos_2d(TGrid &grid_2d, TVector &Im, r2d<Value_type<TVector>> p_i,
 	Value_type<TVector> sigma_i, Value_type<TVector> radius_i)
 	{
 		using T = Value_type<TVector>;
@@ -2125,6 +2326,7 @@ namespace mt
 		Vector<T, e_host> Im_h = Im;
 		return fit_max_pos_2d(grid_2d, Im_h, p_i, sigma_i, radius_i);
 	}
+#endif // __CUDACC__
 
 	inline
 	bool is_gpu_available()

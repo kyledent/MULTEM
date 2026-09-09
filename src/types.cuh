@@ -112,7 +112,9 @@ namespace mt
 	const int c_nqz = 128;
 	const int c_nR = 128;
 
-	const int c_thrnxny = 16;
+	const int c_thrn_x = 32;		// 2D block x-dim: matches warp size for coalesced memory access
+	const int c_thrn_y = 8;			// 2D block y-dim: 32*8 = 256 threads total
+	const int c_nthreads_2d = c_thrn_x * c_thrn_y;	// total threads per 2D block (256)
 	const int c_thrnxy = 256;
 	const double c_Vrl = 0.015;
 
@@ -444,6 +446,48 @@ namespace mt
 
 	};
 
+#ifdef __CUDACC__
+	// Occupancy-based 2D grid configuration.
+	// Uses cudaOccupancyMaxPotentialBlockSize to find optimal thread count,
+	// then factors as dim3(32, N/32) to preserve coalesced access.
+	// Result is cached per kernel template instantiation via static local.
+	template <class KernelFunc>
+	Grid_BT optimal_grid_2d(KernelFunc kernel, int ny, int nx)
+	{
+		static int opt_threads = 0;
+		if (opt_threads == 0)
+		{
+			int min_grid_size;
+			cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &opt_threads, kernel, 0, 0);
+			// Clamp to multiple of 32 (warp size) and reasonable range
+			opt_threads = max(32, (opt_threads / 32) * 32);
+		}
+		int thrn_x = 32;  // keep x=32 for coalesced column-major access
+		int thrn_y = opt_threads / thrn_x;
+		Grid_BT grid_bt;
+		grid_bt.Thr = dim3(thrn_x, thrn_y);
+		grid_bt.Blk = dim3((ny + thrn_x - 1) / thrn_x, (nx + thrn_y - 1) / thrn_y);
+		return grid_bt;
+	}
+
+	// Occupancy-based 1D grid configuration.
+	template <class KernelFunc>
+	Grid_BT optimal_grid_1d(KernelFunc kernel, int n)
+	{
+		static int opt_threads = 0;
+		if (opt_threads == 0)
+		{
+			int min_grid_size;
+			cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &opt_threads, kernel, 0, 0);
+			opt_threads = max(32, opt_threads);
+		}
+		Grid_BT grid_bt;
+		grid_bt.Thr = dim3(opt_threads);
+		grid_bt.Blk = dim3((n + opt_threads - 1) / opt_threads);
+		return grid_bt;
+	}
+#endif
+
 	/*******************forward declarations********************/
 	template <class T>
 	struct is_fundamental;
@@ -516,11 +560,13 @@ namespace mt
 			V = raw_pointer_cast(vector.data());
 		}
 
+#ifndef MULTEM_NO_CUDA
 		rVector(Vector<T, e_device> &vector)
 		{
 			m_size = vector.size();
 			V = raw_pointer_cast(vector.data());
 		}
+#endif
 
 		//rVector(host_vector<T> &vector)
 		//{
@@ -2628,8 +2674,8 @@ namespace mt
 		Grid_BT cuda_grid(const dim3 Blk_max = dim3(0, 0, 0))
 		{
 			Grid_BT grid_bt;
-			grid_bt.Blk = dim3((ny+c_thrnxny-1)/c_thrnxny, (nx+c_thrnxny-1)/c_thrnxny);
-			grid_bt.Thr = dim3(c_thrnxny, c_thrnxny);
+			grid_bt.Blk = dim3((ny+c_thrn_x-1)/c_thrn_x, (nx+c_thrn_y-1)/c_thrn_y);
+			grid_bt.Thr = dim3(c_thrn_x, c_thrn_y);
 
 			if(Blk_max.x != 0)
 			{
@@ -2649,7 +2695,7 @@ namespace mt
 
 		Grid_BT cuda_grid_h(const dim3 Blk_max = dim3(0, 0, 0))
 		{
-			return cuda_grid(dim3((nyh+c_thrnxny-1)/c_thrnxny, (nxh+c_thrnxny-1)/c_thrnxny));
+			return cuda_grid(dim3((nyh+c_thrn_x-1)/c_thrn_x, (nxh+c_thrn_y-1)/c_thrn_y));
 		}
 		#endif
 	};
@@ -3672,8 +3718,8 @@ namespace mt
 			Grid_BT get_eval_cubic_poly_gridBT()
 			{
 				Grid_BT grid_bt;
-				grid_bt.Blk = dim3((ny+c_thrnxny-1)/c_thrnxny, (nx+c_thrnxny-1)/c_thrnxny);
-				grid_bt.Thr = dim3(c_thrnxny, c_thrnxny);
+				grid_bt.Blk = dim3((ny+c_thrn_x-1)/c_thrn_x, (nx+c_thrn_y-1)/c_thrn_y);
+				grid_bt.Thr = dim3(c_thrn_x, c_thrn_y);
 				return grid_bt;
 			}
 	};
@@ -3949,8 +3995,8 @@ namespace mt
 			Grid_BT get_eval_cubic_poly_gridBT()
 			{
 				Grid_BT grid_bt;
-				grid_bt.Blk = dim3((iyn+c_thrnxny-1)/c_thrnxny, (ixn+c_thrnxny-1)/c_thrnxny);
-				grid_bt.Thr = dim3(c_thrnxny, c_thrnxny);
+				grid_bt.Blk = dim3((iyn+c_thrn_x-1)/c_thrn_x, (ixn+c_thrn_y-1)/c_thrn_y);
+				grid_bt.Thr = dim3(c_thrn_x, c_thrn_y);
 				return grid_bt;
 			}
 	};

@@ -540,6 +540,7 @@ namespace mt
 		M_o.assign(M_i.begin(), M_i.end());
 	}
 
+#ifndef MULTEM_NO_CUDA
 	template <class TVector_1, class TVector_2>
 	typename std::enable_if<is_host_vector_and_device_vector<TVector_1, TVector_2>::value
 		&& is_complex<Value_type<TVector_2>>::value && !std::is_same<Value_type<TVector_1>, Value_type<TVector_2>>::value, void>::type
@@ -562,6 +563,7 @@ namespace mt
 	{
 		M_o.assign(M_i.begin(), M_i.end());
 	}
+#endif
 
 	template <class TVector>
 	enable_if_host_vector<TVector, void>
