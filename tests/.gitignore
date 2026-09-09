@@ -1,0 +1,8 @@
+# Everything the harness generates is regenerable.
+results/
+build/
+build_cpu/
+upstream_python_multem/
+*.bin
+*.wisdom
+T?_meta.txt
