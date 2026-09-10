@@ -34,3 +34,10 @@ EDX
 .vscode
 multem.zip
 multem_stable.zip
+
+# local pre-flight output (regenerable)
+.local_bench/
+
+# Site-specific tooling: submits to a particular job system and mirrors results into a
+# particular docs tree. Useful here, meaningless in a clone.
+tools/local/

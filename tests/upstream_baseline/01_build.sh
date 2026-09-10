@@ -49,6 +49,7 @@ report_info "Running CMake configure (upstream source)..."
 CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE=Release
     -DMULTEM_SOURCE_ROOT="${UPSTREAM_DIR}"
+    -DMULTEM_UPSTREAM_SRC="${UPSTREAM_DIR}/MULTEM/src"   # pristine upstream, not this repo's src
 )
 
 # Auto-detect GPU architecture if not specified

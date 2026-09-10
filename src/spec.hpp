@@ -19,6 +19,8 @@
 #ifndef SPECIMEN_H
 #define SPECIMEN_H
 
+#include <chrono>
+#include <cstdlib>
 #include "math.cuh"
 #include "types.cuh"
 #include "lin_alg_def.cuh"
@@ -41,11 +43,33 @@ namespace mt
 
 			Spec(): input_multislice(nullptr){}
 
+			// Phase timing, off unless MULTEM_PHASE_TIMING=1 in the environment. The CUDA API
+			// timeline can only place this cost between two CUDA calls; this says which part of
+			// it is which, which is the difference between a target and a guess.
+			struct PhaseTimer {
+				const char *name; bool on;
+				std::chrono::high_resolution_clock::time_point t0;
+				explicit PhaseTimer(const char *n) : name(n) {
+					const char *e = std::getenv("MULTEM_PHASE_TIMING");
+					on = (e && e[0] == '1');
+					if (on) t0 = std::chrono::high_resolution_clock::now();
+				}
+				~PhaseTimer() {
+					if (!on) return;
+					auto ms = std::chrono::duration<double, std::milli>(
+						std::chrono::high_resolution_clock::now() - t0).count();
+					fprintf(stderr, "  [phase] %-28s %9.1f ms\n", name, ms);
+				}
+			};
+
 			void set_input_data(Input_Multislice<T> *input_multislice_i)
 			{
+				PhaseTimer _t_all("set_input_data TOTAL");
 				input_multislice = input_multislice_i;
 
 				/***************************************************************************/
+				{
+				PhaseTimer _t("atom_type tables (all 103)");
 				Atomic_Data atomic_data(input_multislice->potential_type);
 
 				atom_type.resize(c_nAtomsTypes); 
@@ -53,13 +77,17 @@ namespace mt
 				{
 					atomic_data.To_atom_type_CPU(i+1, input_multislice->Vrl, input_multislice->nR, input_multislice->grid_2d.dR_min(), atom_type[i]);
 				}
+				}
 
 				/***************************************************************************/
-				atoms_u.set_atoms(input_multislice->atoms, input_multislice->grid_2d.pbc_xy, &atom_type);
-				atoms_u.sort_by_z();
+				{ PhaseTimer _t("atoms_u.set_atoms"); 
+				atoms_u.set_atoms(input_multislice->atoms, input_multislice->grid_2d.pbc_xy, &atom_type); }
+				{ PhaseTimer _t("atoms_u.sort_by_z"); 
+				atoms_u.sort_by_z(); }
 
 				/***************************************************************************/
-				slicing.set_input_data(input_multislice, &atoms_u, &atoms);
+				{ PhaseTimer _t("slicing.set_input_data");
+				slicing.set_input_data(input_multislice, &atoms_u, &atoms); }
 
 				/***************************************************************************/
 				if((input_multislice->is_phase_object()) || (atoms_u.s_z_int < 2.0*input_multislice->grid_2d.dz) || ((slicing.z_plane.size() == 1) && input_multislice->is_slicing_by_planes()))
@@ -76,9 +104,11 @@ namespace mt
 					atoms_u.dz = input_multislice->grid_2d.dz;
 				}
 
-				atoms.set_atoms(atoms_u, false, &atom_type);
+				{ PhaseTimer _t("atoms.set_atoms (2nd copy)");
+				atoms.set_atoms(atoms_u, false, &atom_type); }
 				// This is needed for memory preallocation in Transmission function
-				slicing.calculate();
+				{ PhaseTimer _t("slicing.calculate");
+				slicing.calculate(); }
 			}
 
 			/* Move atoms (cgpu_rand distribution will be included in the future) */

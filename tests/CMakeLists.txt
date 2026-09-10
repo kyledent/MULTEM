@@ -39,8 +39,13 @@ if(MULTEM_HAS_CUDA)
   endif()
 endif()
 
-# FFTW finder module (reuse from python-multem)
-set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../python-multem/cmake)
+# python-multem supplies both the wrapper sources and the FFTW finder module, so resolve its
+# root BEFORE find_package -- a fixed ../../python-multem only works in the sibling layout and
+# silently breaks anywhere the tree is staged (a job sandbox, a scratch copy).
+if(NOT MULTEM_SOURCE_ROOT)
+  set(MULTEM_SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../python-multem)
+endif()
+set(CMAKE_MODULE_PATH ${MULTEM_SOURCE_ROOT}/cmake)
 
 # Dependencies
 if(MULTEM_HAS_CUDA)
@@ -80,12 +85,21 @@ if(MULTEM_HAS_CUDA)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda")
 endif()
 
-# Paths to source trees
-if(NOT MULTEM_SOURCE_ROOT)
-  set(MULTEM_SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../python-multem)
-endif()
+# Paths to source trees (MULTEM_SOURCE_ROOT resolved above, before find_package(FFTW))
 set(PYTHON_MULTEM_SRC ${MULTEM_SOURCE_ROOT}/src)
-set(MULTEM_UPSTREAM_SRC ${MULTEM_SOURCE_ROOT}/MULTEM/src)
+
+# MULTEM sources default to this repository's own src/, so the harness tests the tree it
+# lives in rather than whichever MULTEM a sibling python-multem checkout happens to pin.
+# Override with -DMULTEM_UPSTREAM_SRC; upstream_baseline/ does exactly that.
+if(NOT MULTEM_UPSTREAM_SRC)
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../src/types.cuh)
+    set(MULTEM_UPSTREAM_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+  else()
+    set(MULTEM_UPSTREAM_SRC ${MULTEM_SOURCE_ROOT}/MULTEM/src)
+  endif()
+endif()
+message(STATUS "MULTEM sources:      ${MULTEM_UPSTREAM_SRC}")
+message(STATUS "python-multem src:   ${PYTHON_MULTEM_SRC}")
 
 # Stub include paths for CPU-only builds (thrust/CUDA/CUB replacements)
 set(MULTEM_STUBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src)
