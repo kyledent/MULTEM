@@ -23,6 +23,7 @@
 #pragma once
 #endif// _MSC_VER
 
+#include "phase_timer.hpp"
 #include <numeric>
 #include <algorithm>
 
@@ -380,6 +381,7 @@ namespace mt
 				T lx_b = l_x - dl;
 				T ly_b = l_y - dl;
 
+				{ mt::PhaseTimer _t_copy("  set_atoms: copy loop");
 				size_type iatoms_c = 0;
 				for(auto iatoms = 0; iatoms < atoms.size(); iatoms++)
 				{
@@ -398,10 +400,11 @@ namespace mt
 					}
 				}
 
-				resize(iatoms_c);
+				resize(iatoms_c); }
 
 				if(b_statistic)
 				{
+					mt::PhaseTimer _t("  set_atoms: get_statistic");
 					get_statistic(atom_type);
 				}
 			}
@@ -430,6 +433,138 @@ namespace mt
 			}
 
 			// get statistic
+			// Fused replacement for the exact-arithmetic half of get_statistic.
+			//
+			// The original walks the atom arrays about a dozen times -- the Z histogram, min/max over
+			// seven arrays, and the R_int lookup are each their own end-to-end pass over data that was
+			// in registers a pass earlier. This does them in one.
+			//
+			// mean/std is NOT fused. Rewriting it as sum/sum-of-squares would shift the last bits of
+			// x_std and friends, and a speed-up is not worth a silent numerical change; the same
+			// mt::mean_std is called here, so every value this produces is bit-identical to the original.
+			void get_statistic_fused(Vector<Atom_Type<T, e_host>, e_host> *atom_type_ptr)
+			{
+				const bool bAtomTypes = (atom_type_ptr != nullptr);
+				const size_type n = size();
+
+				Z_unique.resize(c_nAtomsTypes);
+				std::fill(Z_unique.begin(), Z_unique.end(), 0);
+
+				int zr_min = get_Z(Z[0]), zr_max = zr_min;
+				Z_min = Z_max = Z[0];
+				x_min = x_max = x[0];  y_min = y_max = y[0];  z_min = z_max = z[0];
+				sigma_min = sigma_max = sigma[0];
+				occ_min = occ_max = occ[0];
+				region_min = region_max = region[0];
+				R_int_min = R_int_max = bAtomTypes
+					? (*atom_type_ptr)[get_Z(Z[0])-1].coef[0].R_max : T(2.5);
+
+				for(size_type i = 0; i < n; i++)
+				{
+					const int zr = get_Z(Z[i]);
+					Z_unique[zr-1] = zr;
+					// Z_min/Z_max keep the RAW Z at the extreme of (Z % 1000), as the original did.
+					if(zr < zr_min) { zr_min = zr; Z_min = Z[i]; }
+					if(zr > zr_max) { zr_max = zr; Z_max = Z[i]; }
+
+					const T xi = x[i], yi = y[i], zi = z[i];
+					if(xi < x_min) x_min = xi; else if(xi > x_max) x_max = xi;
+					if(yi < y_min) y_min = yi; else if(yi > y_max) y_max = yi;
+					if(zi < z_min) z_min = zi; else if(zi > z_max) z_max = zi;
+
+					const float si = sigma[i], oi = occ[i];
+					if(si < sigma_min) sigma_min = si; else if(si > sigma_max) sigma_max = si;
+					if(oi < occ_min) occ_min = oi; else if(oi > occ_max) occ_max = oi;
+
+					const int ri = region[i];
+					if(ri < region_min) region_min = ri; else if(ri > region_max) region_max = ri;
+
+					if(bAtomTypes)
+					{
+						const T Rm = (*atom_type_ptr)[zr-1].coef[0].R_max;
+						if(Rm < R_int_min) R_int_min = Rm; else if(Rm > R_int_max) R_int_max = Rm;
+					}
+				}
+				Z_unique.erase(std::remove_if(Z_unique.begin(), Z_unique.end(),
+					[](int v){ return v<=0; }), Z_unique.end());
+
+				mt::mean_std(x, x_mean, x_std);
+				mt::mean_std(y, y_mean, y_std);
+				mt::mean_std(z, z_mean, z_std);
+			}
+
+			void dump_statistic() const
+			{
+				// Diagnostic dump of EVERY field get_statistic() writes, so two code paths can be compared
+				// field by field rather than by inference from a downstream array. A field left out of
+				// here is a field whose equality nobody checked.
+				const char *_d = std::getenv("MULTEM_STAT_DUMP");
+				if(!(_d && _d[0] == '1')) return;
+				fprintf(stderr, "[stat] n=%zu Zmin=%d Zmax=%d Zunique=", static_cast<size_t>(size()), (int)Z_min, (int)Z_max);
+				for(size_type i = 0; i < Z_unique.size(); i++) fprintf(stderr, "%d,", (int)Z_unique[i]);
+				fprintf(stderr, "\n");
+				fprintf(stderr, "[stat] min/max x=%.17g/%.17g y=%.17g/%.17g z=%.17g/%.17g\n",
+					(double)x_min, (double)x_max, (double)y_min, (double)y_max, (double)z_min, (double)z_max);
+				fprintf(stderr, "[stat] min/max sigma=%.17g/%.17g occ=%.17g/%.17g region=%.17g/%.17g\n",
+					(double)sigma_min, (double)sigma_max, (double)occ_min, (double)occ_max, (double)region_min, (double)region_max);
+				fprintf(stderr, "[stat] mean=%.17g/%.17g/%.17g std=%.17g/%.17g/%.17g\n",
+					(double)x_mean, (double)y_mean, (double)z_mean, (double)x_std, (double)y_std, (double)z_std);
+				fprintf(stderr, "[stat] R_int=%.17g/%.17g s=%.17g/%.17g/%.17g\n",
+					(double)R_int_min, (double)R_int_max, (double)s_x, (double)s_y, (double)s_z);
+				fprintf(stderr, "[stat] int x=%.17g/%.17g y=%.17g/%.17g z=%.17g/%.17g s_int=%.17g/%.17g/%.17g\n",
+					(double)x_int_min, (double)x_int_max, (double)y_int_min, (double)y_int_max, (double)z_int_min, (double)z_int_max, (double)s_x_int, (double)s_y_int, (double)s_z_int);
+				fprintf(stderr, "[stat] l=%.17g/%.17g/%.17g l_int=%.17g/%.17g/%.17g ct=%.17g/%.17g/%.17g\n",
+					(double)l_x, (double)l_y, (double)l_z, (double)l_x_int, (double)l_y_int, (double)l_z_int, (double)ct_a, (double)ct_b, (double)ct_c);
+			}
+
+			// Copy the statistics instead of recomputing them.
+			//
+			// Spec::set_input_data copies the atom array a second time (atoms_u -> atoms) with
+			// pbc filtering off, so every atom survives and every ORDER-INDEPENDENT statistic (min,
+			// max, unique Z, the extents derived from them) equals the one already computed. region
+			// passes through abs(), but the source was produced by the same abs(), so that is
+			// idempotent. mean and std are the exception -- see below.
+			//
+			// Every other field get_statistic() writes is copied. A first version missed l_x_int/l_y_int/
+			// l_z_int -- which only the host path reads, to size its buffers -- because the dump used to
+			// check it did not print them either. Both paths now emit dump_statistic(), which prints
+			// every field, and the two are diffed.
+			template <class X>
+			void copy_statistic_from(const Atom_Data<X> &o)
+			{
+				Z_unique.resize(o.Z_unique.size());
+				for(auto i = 0; i < o.Z_unique.size(); i++) Z_unique[i] = o.Z_unique[i];
+
+				Z_min = o.Z_min;             Z_max = o.Z_max;
+				x_min = o.x_min;             x_max = o.x_max;
+				y_min = o.y_min;             y_max = o.y_max;
+				z_min = o.z_min;             z_max = o.z_max;
+				sigma_min = o.sigma_min;     sigma_max = o.sigma_max;
+				occ_min = o.occ_min;         occ_max = o.occ_max;
+				region_min = o.region_min;   region_max = o.region_max;
+
+				// mean and std are NOT copied. mt::mean_std accumulates in floating point in array
+				// order, and the sort between the two copies reorders the array, so the source's
+				// values differ from a recomputation -- in float over millions of atoms, visibly (the
+				// running sum outgrows the precision of each term). Recompute them in this array's
+				// order, which is what get_statistic() would have done.
+				mt::mean_std(x, x_mean, x_std);
+				mt::mean_std(y, y_mean, y_std);
+				mt::mean_std(z, z_mean, z_std);
+
+				R_int_min = o.R_int_min;     R_int_max = o.R_int_max;
+				s_x = o.s_x;  s_y = o.s_y;  s_z = o.s_z;
+				x_int_min = o.x_int_min;     x_int_max = o.x_int_max;
+				y_int_min = o.y_int_min;     y_int_max = o.y_int_max;
+				z_int_min = o.z_int_min;     z_int_max = o.z_int_max;
+				s_x_int = o.s_x_int;  s_y_int = o.s_y_int;  s_z_int = o.s_z_int;
+				l_x = o.l_x;  l_y = o.l_y;  l_z = o.l_z;
+				l_x_int = o.l_x_int;  l_y_int = o.l_y_int;  l_z_int = o.l_z_int;
+				ct_a = o.ct_a;  ct_b = o.ct_b;  ct_c = o.ct_c;
+
+				dump_statistic();
+			}
+
 			void get_statistic(Vector<Atom_Type<T, e_host>, e_host> *atom_type_ptr = nullptr)
 			{
 				if(empty())
@@ -437,6 +572,15 @@ namespace mt
 					return;
 				}
 
+				// MULTEM_FAST_SETUP=1 selects the fused path, so both can be compared in one binary
+				// on one machine state rather than across a rebuild.
+				const char *_fast_setup = std::getenv("MULTEM_FAST_SETUP");
+				if(_fast_setup && _fast_setup[0] == '1')
+				{
+					get_statistic_fused(atom_type_ptr);
+				}
+				else
+				{
 				get_Z_unique();
 
 				auto Z_min_max = std::minmax_element(Z.begin(), Z.end(), [](const int &a, const int &b){ return (a % 1000)<(b % 1000); });
@@ -464,6 +608,8 @@ namespace mt
 						R_int_min = min((*atom_type_ptr)[get_Z(Z[iatoms])-1].coef[0].R_max, R_int_min);
 						R_int_max = max((*atom_type_ptr)[get_Z(Z[iatoms])-1].coef[0].R_max, R_int_max);
 					}
+				}
+
 				}
 
 				s_x = x_max - x_min;
@@ -513,6 +659,8 @@ namespace mt
 				{
 					ct_c = l_z;
 				}
+
+				dump_statistic();
 			}
 
 			// Sort atoms along z-axis.

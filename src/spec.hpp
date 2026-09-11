@@ -19,8 +19,7 @@
 #ifndef SPECIMEN_H
 #define SPECIMEN_H
 
-#include <chrono>
-#include <cstdlib>
+#include "phase_timer.hpp"
 #include "math.cuh"
 #include "types.cuh"
 #include "lin_alg_def.cuh"
@@ -43,33 +42,14 @@ namespace mt
 
 			Spec(): input_multislice(nullptr){}
 
-			// Phase timing, off unless MULTEM_PHASE_TIMING=1 in the environment. The CUDA API
-			// timeline can only place this cost between two CUDA calls; this says which part of
-			// it is which, which is the difference between a target and a guess.
-			struct PhaseTimer {
-				const char *name; bool on;
-				std::chrono::high_resolution_clock::time_point t0;
-				explicit PhaseTimer(const char *n) : name(n) {
-					const char *e = std::getenv("MULTEM_PHASE_TIMING");
-					on = (e && e[0] == '1');
-					if (on) t0 = std::chrono::high_resolution_clock::now();
-				}
-				~PhaseTimer() {
-					if (!on) return;
-					auto ms = std::chrono::duration<double, std::milli>(
-						std::chrono::high_resolution_clock::now() - t0).count();
-					fprintf(stderr, "  [phase] %-28s %9.1f ms\n", name, ms);
-				}
-			};
-
 			void set_input_data(Input_Multislice<T> *input_multislice_i)
 			{
-				PhaseTimer _t_all("set_input_data TOTAL");
+				mt::PhaseTimer _t_all("set_input_data TOTAL");
 				input_multislice = input_multislice_i;
 
 				/***************************************************************************/
 				{
-				PhaseTimer _t("atom_type tables (all 103)");
+				mt::PhaseTimer _t("atom_type tables (all 103)");
 				Atomic_Data atomic_data(input_multislice->potential_type);
 
 				atom_type.resize(c_nAtomsTypes); 
@@ -80,13 +60,13 @@ namespace mt
 				}
 
 				/***************************************************************************/
-				{ PhaseTimer _t("atoms_u.set_atoms"); 
+				{ mt::PhaseTimer _t("atoms_u.set_atoms"); 
 				atoms_u.set_atoms(input_multislice->atoms, input_multislice->grid_2d.pbc_xy, &atom_type); }
-				{ PhaseTimer _t("atoms_u.sort_by_z"); 
+				{ mt::PhaseTimer _t("atoms_u.sort_by_z");
 				atoms_u.sort_by_z(); }
 
 				/***************************************************************************/
-				{ PhaseTimer _t("slicing.set_input_data");
+				{ mt::PhaseTimer _t("slicing.set_input_data");
 				slicing.set_input_data(input_multislice, &atoms_u, &atoms); }
 
 				/***************************************************************************/
@@ -104,10 +84,23 @@ namespace mt
 					atoms_u.dz = input_multislice->grid_2d.dz;
 				}
 
-				{ PhaseTimer _t("atoms.set_atoms (2nd copy)");
-				atoms.set_atoms(atoms_u, false, &atom_type); }
+				{ mt::PhaseTimer _t("atoms.set_atoms (2nd copy)");
+				// This copy takes every atom of atoms_u with pbc filtering off, so its order-independent
+				// statistics are the ones just computed and can be copied; mean/std depend on summation
+				// order, which the sort changed, and are recomputed. MULTEM_SKIP_REDUNDANT_STATS=1
+				// selects it, and both paths emit dump_statistic() so the result is checked, not assumed.
+				const char *_skip_stats = std::getenv("MULTEM_SKIP_REDUNDANT_STATS");
+				if(_skip_stats && _skip_stats[0] == '1')
+				{
+					atoms.set_atoms(atoms_u, false, &atom_type, false);
+					atoms.copy_statistic_from(atoms_u);
+				}
+				else
+				{
+					atoms.set_atoms(atoms_u, false, &atom_type);
+				} }
 				// This is needed for memory preallocation in Transmission function
-				{ PhaseTimer _t("slicing.calculate");
+				{ mt::PhaseTimer _t("slicing.calculate");
 				slicing.calculate(); }
 			}
 
