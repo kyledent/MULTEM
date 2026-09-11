@@ -21,7 +21,7 @@ namespace mt
 	//
 	// The sequential path is thrust's stable radix sort over an 8-way zip: single-threaded, while
 	// the GPU waits, and on a large specimen the largest single cost before the first slice. This
-	// sorts a compact (key, original index) array on several threads -- a sort per thread, then
+	// sorts a compact (key, original index) array on several threads -- a radix sort per thread, then
 	// pairwise merges split across all the threads by merge path -- and applies the resulting
 	// permutation to each field once.
 	//
@@ -104,6 +104,30 @@ namespace mt
 		});
 	}
 
+	// Stable LSD radix sort of n items by their unsigned key k, one byte per pass, using tmp (n items)
+	// as scratch. Stable, so items entering in index order leave ordered by (key, index) -- the same
+	// order the merge comparator imposes. A pass whose byte is the same for every item would only copy
+	// the array and is skipped. It replaces a comparison sort per chunk, which at few threads could be
+	// slower than the sequential radix sort it was meant to beat (n log n per chunk against n overall).
+	template <class TItem>
+	void host_radix_sort_items(TItem *a, TItem *tmp, std::size_t n)
+	{
+		if(n < 2) return;
+		using TCode = decltype(a->k);
+		TItem *src = a, *dst = tmp;
+		for(int pass = 0; pass < int(sizeof(TCode)); pass++)
+		{
+			const int shift = 8*pass;
+			std::size_t count[257] = {0};
+			for(std::size_t i = 0; i < n; i++) count[((src[i].k >> shift) & 0xFF) + 1]++;
+			if(count[((src[0].k >> shift) & 0xFF) + 1] == n) continue;
+			for(int d = 0; d < 256; d++) count[d + 1] += count[d];
+			for(std::size_t i = 0; i < n; i++) dst[count[(src[i].k >> shift) & 0xFF]++] = src[i];
+			std::swap(src, dst);
+		}
+		if(src != a) std::copy(src, src + n, a);
+	}
+
 	// The permutation that stably sorts key[0, n): key[perm[0]] <= key[perm[1]] <= ...
 	template <class TKey>
 	std::unique_ptr<uint32_t[]> host_stable_sort_permutation(const TKey *key, std::size_t n, int nthreads)
@@ -127,7 +151,8 @@ namespace mt
 				{
 					a[j] = Item{radix_order_key(key[j]), static_cast<uint32_t>(j)};
 				}
-				std::sort(a.get() + runs[t], a.get() + runs[t + 1], less);
+				// b is free until the merges, so its matching range is this chunk's scratch
+				host_radix_sort_items(a.get() + runs[t], b.get() + runs[t], runs[t + 1] - runs[t]);
 			});
 		}
 
