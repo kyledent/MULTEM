@@ -24,6 +24,12 @@
 #include "atomic_data_mt.hpp"
 #include "cpu_fcns.hpp"
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include "phase_timer.hpp"
+
 namespace mt
 {
 	template <class T>
@@ -154,7 +160,39 @@ namespace mt
 						z_ct.push_back(atoms.z[iz]);
 					}
 				}
-				std::sort(z_ct.begin(), z_ct.end());
+				// The atoms arrive sorted by z, so z_ct normally is too, and sorting it again is a
+				// sequential sort of every crystal atom's z for nothing. MULTEM_FAST_PLANES=1 skips it when
+				// z_ct is already ascending AND holds no -0.0: then every tie is bit-identical, so std::sort
+				// could only reproduce the input. (It is not stable, so with -0.0 and +0.0 both present it
+				// might order them differently -- that case sorts as before.) MULTEM_PLANES_CHECK=1 runs
+				// both and counts values that differ in any bit.
+				{ mt::PhaseTimer _t("  slicing: sort crystal z");
+				auto sorted_no_negative_zero = [](const TVector_r &v)
+				{
+					for(size_type i = 0; i < v.size(); i++)
+					{
+						if(v[i] == T(0) && std::signbit(v[i])) return false;
+						if(i > 0 && v[i] < v[i-1]) return false;
+					}
+					return true;
+				};
+				const char *_fast_planes = std::getenv("MULTEM_FAST_PLANES");
+				const char *_planes_check = std::getenv("MULTEM_PLANES_CHECK");
+				if(_planes_check && _planes_check[0] == '1')
+				{
+					TVector_r ref = z_ct;
+					std::sort(ref.begin(), ref.end());
+					const bool skip = sorted_no_negative_zero(z_ct);
+					if(!skip) std::sort(z_ct.begin(), z_ct.end());
+					size_type n_diff = 0;
+					for(size_type i = 0; i < z_ct.size(); i++) n_diff += (std::memcmp(&z_ct[i], &ref[i], sizeof(T)) != 0) ? 1 : 0;
+					fprintf(stderr, "  [check] get_z_plane: %zu crystal z values, %s, %zu differ from std::sort\n",
+						static_cast<size_t>(z_ct.size()), skip ? "already ascending (sort skipped)" : "sorted", static_cast<size_t>(n_diff));
+				}
+				else if(!(_fast_planes && _fast_planes[0] == '1' && sorted_no_negative_zero(z_ct)))
+				{
+					std::sort(z_ct.begin(), z_ct.end());
+				} }
 
 				// calculate z crystal limits
 				T z_ct_min = z_ct.front();
