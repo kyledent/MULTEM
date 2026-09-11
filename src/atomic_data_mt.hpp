@@ -384,25 +384,27 @@ namespace mt
 				T ly_b = l_y - dl;
 
 				{ mt::PhaseTimer _t_copy("  set_atoms: copy loop");
-				size_type iatoms_c = 0;
-				for(auto iatoms = 0; iatoms < atoms.size(); iatoms++)
+				// MULTEM_PAR_COPY=1 copies on host threads -- the same atoms, in the same order;
+				// MULTEM_COPY_CHECK=1 also copies the sequential way into a copy and counts differences.
+				const char *_par_copy = std::getenv("MULTEM_PAR_COPY");
+				const char *_copy_check = std::getenv("MULTEM_COPY_CHECK");
+				if(_copy_check && _copy_check[0] == '1')
 				{
-					if((!pbc_xy_i)||((atoms.x[iatoms]<lx_b) && (atoms.y[iatoms]<ly_b)))
-					{
-						Z[iatoms_c] = atoms.Z[iatoms];
-						x[iatoms_c] = atoms.x[iatoms];
-						y[iatoms_c] = atoms.y[iatoms];
-						z[iatoms_c] = atoms.z[iatoms];
-						sigma[iatoms_c] = atoms.sigma[iatoms];
-						occ[iatoms_c] = atoms.occ[iatoms];
-						region[iatoms_c] = abs(atoms.region[iatoms]);
-						charge[iatoms_c] = atoms.charge[iatoms];
-
-						iatoms_c++;
-					}
+					const int nt = host_sort_threads();
+					Atom_Data<T> ref(*this);	// copy-CONSTRUCTED: the templated operator= is not a copy
+					ref.copy_atoms_sequential(atoms, pbc_xy_i, lx_b, ly_b);
+					copy_atoms_parallel(atoms, pbc_xy_i, lx_b, ly_b, nt);
+					fprintf(stderr, "  [check] set_atoms copy: %zu of %zu atoms kept, %d threads, %zu differ from the sequential copy\n",
+						static_cast<size_t>(size()), static_cast<size_t>(atoms.size()), nt, static_cast<size_t>(count_differences(ref)));
 				}
-
-				resize(iatoms_c); }
+				else if(_par_copy && _par_copy[0] == '1')
+				{
+					copy_atoms_parallel(atoms, pbc_xy_i, lx_b, ly_b, host_sort_threads());
+				}
+				else
+				{
+					copy_atoms_sequential(atoms, pbc_xy_i, lx_b, ly_b);
+				} }
 
 				if(b_statistic)
 				{
@@ -432,6 +434,83 @@ namespace mt
 				}
 
 				Z_unique.erase(std::remove_if(Z_unique.begin(), Z_unique.end(), [](int v){ return v<=0; }), Z_unique.end());
+			}
+
+			// The original copy loop: keep the atoms inside the box when pbc_xy_i, in input order.
+			template <class X>
+			void copy_atoms_sequential(const Atom_Data<X> &atoms, bool pbc_xy_i, T lx_b, T ly_b)
+			{
+				size_type iatoms_c = 0;
+				for(auto iatoms = 0; iatoms < atoms.size(); iatoms++)
+				{
+					if((!pbc_xy_i)||((atoms.x[iatoms]<lx_b) && (atoms.y[iatoms]<ly_b)))
+					{
+						Z[iatoms_c] = atoms.Z[iatoms];
+						x[iatoms_c] = atoms.x[iatoms];
+						y[iatoms_c] = atoms.y[iatoms];
+						z[iatoms_c] = atoms.z[iatoms];
+						sigma[iatoms_c] = atoms.sigma[iatoms];
+						occ[iatoms_c] = atoms.occ[iatoms];
+						region[iatoms_c] = abs(atoms.region[iatoms]);
+						charge[iatoms_c] = atoms.charge[iatoms];
+
+						iatoms_c++;
+					}
+				}
+
+				resize(iatoms_c);
+			}
+
+			// The same copy on nthreads host threads, element for element. With pbc_xy_i the kept atoms
+			// are compacted: each thread first counts what its range keeps, so a prefix sum tells it
+			// where its output starts, and the kept atoms land in the order the sequential loop gives.
+			template <class X>
+			void copy_atoms_parallel(const Atom_Data<X> &atoms, bool pbc_xy_i, T lx_b, T ly_b, int nthreads)
+			{
+				const size_type n = atoms.size();
+				if(nthreads < 2 || n < (size_type(1) << 16))
+				{
+					copy_atoms_sequential(atoms, pbc_xy_i, lx_b, ly_b);
+					return;
+				}
+				const int *sZ = &atoms.Z[0], *sregion = &atoms.region[0], *scharge = &atoms.charge[0];
+				const X *sx = &atoms.x[0], *sy = &atoms.y[0], *sz = &atoms.z[0];
+				const float *ssigma = &atoms.sigma[0], *socc = &atoms.occ[0];
+				int *dZ = &Z[0], *dregion = &region[0], *dcharge = &charge[0];
+				T *dx = &x[0], *dy = &y[0], *dz_ = &z[0];
+				float *dsigma = &sigma[0], *docc = &occ[0];
+				// the same test, with the same operand types, as the sequential loop
+				auto keep = [&](size_type i){ return (!pbc_xy_i) || ((sx[i] < lx_b) && (sy[i] < ly_b)); };
+
+				std::vector<size_type> first(nthreads + 1, 0);
+				if(pbc_xy_i)
+				{
+					host_parallel_for(nthreads, [&](int t)
+					{
+						size_type c = 0;
+						for(size_type i = n*t/nthreads; i < n*(t + 1)/nthreads; i++) c += keep(i) ? 1 : 0;
+						first[t + 1] = c;
+					});
+					for(int t = 0; t < nthreads; t++) first[t + 1] += first[t];
+				}
+				else
+				{
+					for(int t = 0; t <= nthreads; t++) first[t] = n*t/nthreads;
+				}
+
+				host_parallel_for(nthreads, [&](int t)
+				{
+					size_type o = first[t];
+					for(size_type i = n*t/nthreads; i < n*(t + 1)/nthreads; i++)
+					{
+						if(!keep(i)) continue;
+						dZ[o] = sZ[i]; dx[o] = sx[i]; dy[o] = sy[i]; dz_[o] = sz[i];
+						dsigma[o] = ssigma[i]; docc[o] = socc[i];
+						dregion[o] = abs(sregion[i]); dcharge[o] = scharge[i];
+						o++;
+					}
+				});
+				resize(first[nthreads]);
 			}
 
 			// get statistic

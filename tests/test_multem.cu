@@ -229,6 +229,17 @@ RunResult run_test(
     const char *phonons_env = std::getenv("MULTEM_TEST_PHONONS");
     const int phonons = phonons_env ? std::atoi(phonons_env) : 0;
 
+    // MULTEM_TEST_CROP=f (0 < f < 1): shrink the box in x and y by f, leaving the atoms where they
+    // are, so that with periodic boundaries the atoms beyond it are dropped when the specimen is
+    // copied in. The generated specimen otherwise fits the box exactly and nothing is ever dropped,
+    // which leaves the dropping path of that copy untested.
+    const char *crop_env = std::getenv("MULTEM_TEST_CROP");
+    const double crop = crop_env ? std::atof(crop_env) : 1.0;
+    if (crop > 0.0 && crop < 1.0) {
+        lx *= crop;
+        ly *= crop;
+    }
+
     result.n_atoms = atoms.size();
     result.nx = tc.nx;
     result.ny = tc.ny;
@@ -236,8 +247,9 @@ RunResult run_test(
 
     printf("  Test: %s\n", tc.name);
     printf("  Grid: %d x %d\n", tc.nx, tc.ny);
-    printf("  Atoms: %zu (%s order, %s)\n", atoms.size(), shuffled ? "shuffled" : "generated z-major",
-           phonons > 0 ? (std::to_string(phonons) + " frozen-phonon configurations").c_str() : "still atoms");
+    printf("  Atoms: %zu (%s order, %s%s)\n", atoms.size(), shuffled ? "shuffled" : "generated z-major",
+           phonons > 0 ? (std::to_string(phonons) + " frozen-phonon configurations").c_str() : "still atoms",
+           (crop > 0.0 && crop < 1.0) ? (", box cropped to " + std::to_string(crop)).c_str() : "");
     printf("  Specimen: %.1f x %.1f x %.1f A\n", lx, ly, lz);
     printf("  Slices: ~%d (dz=%.1f A)\n", result.n_slices_approx, tc.spec_dz);
     printf("  Device: %s, Precision: %s\n", device.c_str(), precision.c_str());
