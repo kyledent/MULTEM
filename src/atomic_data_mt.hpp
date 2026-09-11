@@ -27,6 +27,7 @@
 #include "host_par_sort.hpp"
 #include <numeric>
 #include <algorithm>
+#include <string>
 
 #include "math.cuh"
 #include "types.cuh"
@@ -494,28 +495,48 @@ namespace mt
 				mt::mean_std(z, z_mean, z_std);
 			}
 
+			// Every field get_statistic() writes, as text: one definition of "every field", used both to
+			// print (dump_statistic) and to compare (count_differences). A field left out of here is a
+			// field whose equality nobody checks. %.17g prints each value exactly.
+			std::string statistic_text() const
+			{
+				std::string s;
+				char b[512];
+				snprintf(b, sizeof b, "[stat] n=%zu Zmin=%d Zmax=%d Zunique=", static_cast<size_t>(size()), (int)Z_min, (int)Z_max); s += b;
+				for(size_type i = 0; i < Z_unique.size(); i++) { snprintf(b, sizeof b, "%d,", (int)Z_unique[i]); s += b; }
+				s += "\n";
+				snprintf(b, sizeof b, "[stat] min/max x=%.17g/%.17g y=%.17g/%.17g z=%.17g/%.17g\n", (double)x_min, (double)x_max, (double)y_min, (double)y_max, (double)z_min, (double)z_max); s += b;
+				snprintf(b, sizeof b, "[stat] min/max sigma=%.17g/%.17g occ=%.17g/%.17g region=%.17g/%.17g\n", (double)sigma_min, (double)sigma_max, (double)occ_min, (double)occ_max, (double)region_min, (double)region_max); s += b;
+				snprintf(b, sizeof b, "[stat] mean=%.17g/%.17g/%.17g std=%.17g/%.17g/%.17g\n", (double)x_mean, (double)y_mean, (double)z_mean, (double)x_std, (double)y_std, (double)z_std); s += b;
+				snprintf(b, sizeof b, "[stat] R_int=%.17g/%.17g s=%.17g/%.17g/%.17g\n", (double)R_int_min, (double)R_int_max, (double)s_x, (double)s_y, (double)s_z); s += b;
+				snprintf(b, sizeof b, "[stat] int x=%.17g/%.17g y=%.17g/%.17g z=%.17g/%.17g s_int=%.17g/%.17g/%.17g\n", (double)x_int_min, (double)x_int_max, (double)y_int_min, (double)y_int_max, (double)z_int_min, (double)z_int_max, (double)s_x_int, (double)s_y_int, (double)s_z_int); s += b;
+				snprintf(b, sizeof b, "[stat] l=%.17g/%.17g/%.17g l_int=%.17g/%.17g/%.17g ct=%.17g/%.17g/%.17g\n", (double)l_x, (double)l_y, (double)l_z, (double)l_x_int, (double)l_y_int, (double)l_z_int, (double)ct_a, (double)ct_b, (double)ct_c); s += b;
+				return s;
+			}
+
+			// Diagnostic dump (MULTEM_STAT_DUMP=1), so two code paths can be compared field by field
+			// rather than by inference from a downstream array.
 			void dump_statistic() const
 			{
-				// Diagnostic dump of EVERY field get_statistic() writes, so two code paths can be compared
-				// field by field rather than by inference from a downstream array. A field left out of
-				// here is a field whose equality nobody checked.
 				const char *_d = std::getenv("MULTEM_STAT_DUMP");
-				if(!(_d && _d[0] == '1')) return;
-				fprintf(stderr, "[stat] n=%zu Zmin=%d Zmax=%d Zunique=", static_cast<size_t>(size()), (int)Z_min, (int)Z_max);
-				for(size_type i = 0; i < Z_unique.size(); i++) fprintf(stderr, "%d,", (int)Z_unique[i]);
-				fprintf(stderr, "\n");
-				fprintf(stderr, "[stat] min/max x=%.17g/%.17g y=%.17g/%.17g z=%.17g/%.17g\n",
-					(double)x_min, (double)x_max, (double)y_min, (double)y_max, (double)z_min, (double)z_max);
-				fprintf(stderr, "[stat] min/max sigma=%.17g/%.17g occ=%.17g/%.17g region=%.17g/%.17g\n",
-					(double)sigma_min, (double)sigma_max, (double)occ_min, (double)occ_max, (double)region_min, (double)region_max);
-				fprintf(stderr, "[stat] mean=%.17g/%.17g/%.17g std=%.17g/%.17g/%.17g\n",
-					(double)x_mean, (double)y_mean, (double)z_mean, (double)x_std, (double)y_std, (double)z_std);
-				fprintf(stderr, "[stat] R_int=%.17g/%.17g s=%.17g/%.17g/%.17g\n",
-					(double)R_int_min, (double)R_int_max, (double)s_x, (double)s_y, (double)s_z);
-				fprintf(stderr, "[stat] int x=%.17g/%.17g y=%.17g/%.17g z=%.17g/%.17g s_int=%.17g/%.17g/%.17g\n",
-					(double)x_int_min, (double)x_int_max, (double)y_int_min, (double)y_int_max, (double)z_int_min, (double)z_int_max, (double)s_x_int, (double)s_y_int, (double)s_z_int);
-				fprintf(stderr, "[stat] l=%.17g/%.17g/%.17g l_int=%.17g/%.17g/%.17g ct=%.17g/%.17g/%.17g\n",
-					(double)l_x, (double)l_y, (double)l_z, (double)l_x_int, (double)l_y_int, (double)l_z_int, (double)ct_a, (double)ct_b, (double)ct_c);
+				if(_d && _d[0] == '1') fputs(statistic_text().c_str(), stderr);
+			}
+
+			// Atoms that differ from o's in any bit of any field, plus one if any statistic differs.
+			size_type count_differences(const Atom_Data<T> &o) const
+			{
+				if(o.size() != size()) return std::max(size(), o.size()) + 1;
+				auto same = [](const void *a, const void *b, std::size_t n){ return std::memcmp(a, b, n) == 0; };
+				size_type n_diff = 0;
+				for(size_type i = 0; i < size(); i++)
+				{
+					const bool ok = same(&Z[i], &o.Z[i], sizeof(Z[i])) && same(&x[i], &o.x[i], sizeof(x[i]))
+						&& same(&y[i], &o.y[i], sizeof(y[i])) && same(&z[i], &o.z[i], sizeof(z[i]))
+						&& same(&sigma[i], &o.sigma[i], sizeof(sigma[i])) && same(&occ[i], &o.occ[i], sizeof(occ[i]))
+						&& same(&region[i], &o.region[i], sizeof(region[i])) && same(&charge[i], &o.charge[i], sizeof(charge[i]));
+					n_diff += ok ? 0 : 1;
+				}
+				return n_diff + (statistic_text() == o.statistic_text() ? 0 : 1);
 			}
 
 			// Copy the statistics instead of recomputing them.

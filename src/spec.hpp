@@ -20,6 +20,8 @@
 #define SPECIMEN_H
 
 #include "phase_timer.hpp"
+#include <climits>
+#include <memory>
 #include "math.cuh"
 #include "types.cuh"
 #include "lin_alg_def.cuh"
@@ -40,7 +42,7 @@ namespace mt
 			using T_r = T;
 			using size_type = std::size_t;
 
-			Spec(): input_multislice(nullptr){}
+			Spec(): input_multislice(nullptr), atoms_conf(c_conf_none){}
 
 			void set_input_data(Input_Multislice<T> *input_multislice_i)
 			{
@@ -102,6 +104,9 @@ namespace mt
 				// This is needed for memory preallocation in Transmission function
 				{ mt::PhaseTimer _t("slicing.calculate");
 				slicing.calculate(); }
+
+				// atoms now holds the still (undisplaced) configuration: a copy of atoms_u
+				atoms_conf = c_conf_still;
 			}
 
 			// Sort by z. MULTEM_PAR_SORT=1 sorts on host threads, in the same order as the sequential
@@ -130,6 +135,29 @@ namespace mt
 			/* Move atoms (cgpu_rand distribution will be included in the future) */
 			void move_atoms(const int &fp_iconf)
 			{
+				// Which configuration this call produces. Without frozen phonons every call yields the
+				// still configuration -- a copy of atoms_u -- whatever fp_iconf is; with them, the
+				// displacement is seeded by pn_seed and fp_iconf alone, so a repeated fp_iconf yields the
+				// same atoms. Only Spec writes these arrays, so when atoms already holds the requested
+				// configuration, rebuilding it (copy, sort, statistics) reproduces what is there.
+				// MULTEM_REUSE_CONF=1 skips the rebuild then; MULTEM_REUSE_CHECK=1 rebuilds anyway and
+				// counts every difference from what would have been kept.
+				const int conf = input_multislice->is_frozen_phonon() ? fp_iconf : int(c_conf_still);
+				const bool held = (conf == atoms_conf);
+				const char *reuse = std::getenv("MULTEM_REUSE_CONF");
+				const char *check = std::getenv("MULTEM_REUSE_CHECK");
+				const bool checking = held && check && check[0] == '1';
+				if(held && !checking && reuse && reuse[0] == '1')
+				{
+					slicing.calculate();
+					return;
+				}
+
+				// copy-CONSTRUCTED on purpose: Atom_Data's templated operator= re-derives the atoms
+				// through set_atoms, so an assignment would not be a copy
+				std::unique_ptr<Atom_Data<T>> kept(checking ? new Atom_Data<T>(atoms) : nullptr);
+				{ mt::PhaseTimer _t("move_atoms (rebuild)");
+
 				// set phonon configuration
 				if(input_multislice->is_frozen_phonon())
 				{
@@ -168,8 +196,18 @@ namespace mt
 				// get atom information
 				atoms.get_statistic(&atom_type);
 
+				}
+
 				// slicing procedure
 				slicing.calculate();
+				atoms_conf = conf;
+
+				if(kept)
+				{
+					const auto n_diff = atoms.count_differences(*kept);
+					fprintf(stderr, "  [check] move_atoms: %zu atoms, %zu differ from the configuration already held\n",
+						static_cast<size_t>(atoms.size()), static_cast<size_t>(n_diff));
+				}
 			}
 
 			T dz(const int &islice)
@@ -190,6 +228,10 @@ namespace mt
 		private:
 			Randn_3d<T, e_host> rand;
 			Atom_Data<T> atoms_u;
+
+			// which configuration atoms holds (see move_atoms); enumerators, so no definition is needed
+			enum : int { c_conf_none = INT_MIN, c_conf_still = INT_MIN + 1 };
+			int atoms_conf;
 	};
 
 } // namespace mt

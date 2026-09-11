@@ -224,6 +224,11 @@ RunResult run_test(
         std::shuffle(atoms.begin(), atoms.end(), std::mt19937_64(12345));
     }
 
+    // MULTEM_TEST_PHONONS=N: N frozen-phonon configurations instead of still atoms, to exercise the
+    // per-configuration path (move_atoms displaces the atoms and re-derives their statistics each time).
+    const char *phonons_env = std::getenv("MULTEM_TEST_PHONONS");
+    const int phonons = phonons_env ? std::atoi(phonons_env) : 0;
+
     result.n_atoms = atoms.size();
     result.nx = tc.nx;
     result.ny = tc.ny;
@@ -231,7 +236,8 @@ RunResult run_test(
 
     printf("  Test: %s\n", tc.name);
     printf("  Grid: %d x %d\n", tc.nx, tc.ny);
-    printf("  Atoms: %zu (%s order)\n", atoms.size(), shuffled ? "shuffled" : "generated z-major");
+    printf("  Atoms: %zu (%s order, %s)\n", atoms.size(), shuffled ? "shuffled" : "generated z-major",
+           phonons > 0 ? (std::to_string(phonons) + " frozen-phonon configurations").c_str() : "still atoms");
     printf("  Specimen: %.1f x %.1f x %.1f A\n", lx, ly, lz);
     printf("  Slices: ~%d (dz=%.1f A)\n", result.n_slices_approx, tc.spec_dz);
     printf("  Device: %s, Precision: %s\n", device.c_str(), precision.c_str());
@@ -250,6 +256,10 @@ RunResult run_test(
 
     input.pn_model = "Still_Atom";
     input.pn_nconf = 1;
+    if (phonons > 0) {
+        input.pn_model = "Frozen_Phonon";
+        input.pn_nconf = phonons;
+    }
 
     input.spec_atoms = atoms;
     input.spec_lx = lx;
