@@ -164,7 +164,10 @@ namespace mt
 					return;
 				}
 
-#ifdef MULTEM_USE_OPENMP
+// The define alone is not enough: a .cu file can receive MULTEM_USE_OPENMP without -fopenmp (the
+// OpenMP flags of a CMake target apply to CXX sources only). The pragma is then ignored and this
+// runs on one thread, so require the compiler's own macro and otherwise use the std::thread path.
+#if defined(MULTEM_USE_OPENMP) && defined(_OPENMP)
 				// OpenMP: parallelize over the full 2D grid directly
 				// Only use OpenMP when grid is large enough to justify overhead
 				if (nx * ny >= 4096) {
@@ -209,7 +212,10 @@ namespace mt
 					return;
 				}
 
-#ifdef MULTEM_USE_OPENMP
+// The define alone is not enough: a .cu file can receive MULTEM_USE_OPENMP without -fopenmp (the
+// OpenMP flags of a CMake target apply to CXX sources only). The pragma is then ignored and this
+// runs on one thread, so require the compiler's own macro and otherwise use the std::thread path.
+#if defined(MULTEM_USE_OPENMP) && defined(_OPENMP)
 				// OpenMP: parallelize over the flat index directly
 				#pragma omp parallel for schedule(static)
 				for(int ixy = 0; ixy < nxy; ixy++)
