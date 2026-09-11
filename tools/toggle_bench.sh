@@ -39,15 +39,19 @@ for r in rows:
     if repeats[(r["test"], p)] > 1:
         p = f"{p} #{seen[(run(r), p)]}"
     agg[(r["test"], p, r["toggle"])].append(float(r["ms"]))
+# Medians beside the means: one disturbed repeat (a neighbour's burst of work) moves a mean of four
+# but not a median, and the spread column says when that has happened.
 mean = lambda v: f"{statistics.mean(v):>10.1f}" if v else f"{'--':>10}"
+med = lambda v: f"{statistics.median(v):>10.1f}" if v else f"{'--':>10}"
 spread = lambda v: f"{(max(v) - min(v)) / min(v) * 100 if min(v) else 0:>10.0f}%" if v else f"{'':>11}"
 keys = sorted({(t, p) for (t, p, _) in agg})
 print(f"  {'test':<6}{'phase':<34}{'off':>10}{'on':>10}{'saved':>10}"
-      f"{'spread off':>12}{'spread on':>11}")
+      f"{'spread off':>12}{'spread on':>11}{'med off':>10}{'med on':>10}{'med saved':>11}")
 for t, p in keys:
     off, on = agg.get((t, p, "off")), agg.get((t, p, "on"))
     saved = f"{statistics.mean(off) - statistics.mean(on):>+10.1f}" if off and on else f"{'':>10}"
-    print(f"  {t:<6}{p[:33]:<34}{mean(off)}{mean(on)}{saved} {spread(off)}{spread(on)}")
+    msaved = f"{statistics.median(off) - statistics.median(on):>+11.1f}" if off and on else f"{'':>11}"
+    print(f"  {t:<6}{p[:33]:<34}{mean(off)}{mean(on)}{saved} {spread(off)}{spread(on)}{med(off)}{med(on)}{msaved}")
 PY
 }
 
