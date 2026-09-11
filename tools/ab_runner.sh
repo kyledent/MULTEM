@@ -126,7 +126,19 @@ print(out)
 (r / "comparison.txt").write_text(out + "\n")
 PY
 
-# correctness: the optimisations must not change the answer
+# Correctness, with a floor. This program is not deterministic run to run -- measured at ~6.3e-06
+# max relative, same binary and settings -- so a bare control-vs-treatment difference cannot show
+# that an optimisation preserves results: the arms can differ by less than the program differs from
+# itself. Re-run the control once more and report that self-difference as the floor, so the arm
+# comparison is interpretable instead of merely reassuring.
+echo; echo "───────── determinism floor (control run twice) ─────────"
+FLOOR="${WORK}/floor"; mkdir -p "${FLOOR}"
+for T in ${TESTS}; do
+    "${WORK}/build_control/test_multem" --test "${T}" --device device --precision float \
+        --output "${FLOOR}" > /dev/null 2>&1 || true
+    cp -f "${FLOOR}/${T}_real.bin" "${RESULTS}/floor_${T}_real.bin" 2>/dev/null || true
+done
+
 echo; echo "───────── correctness (control vs treatment output) ─────────"
 python3 - "${RESULTS}" <<'PY'
 import sys, pathlib, struct
@@ -140,7 +152,15 @@ for cf in sorted(r.glob("control_T*_real.bin")):
         print(f"  {cf.name}: SIZE MISMATCH"); worst = float("inf"); continue
     scale = max(max(abs(x) for x in a), 1e-30)
     d = max(abs(x - y) for x, y in zip(a, b)) / scale
-    print(f"  {cf.name[8:-9]}: max relative difference {d:.3e}")
+    ff = r / f"floor_{cf.name[8:]}"
+    fd = None
+    if ff.exists():
+        c2 = struct.unpack(f"{ff.stat().st_size//4}f", ff.read_bytes())
+        if len(c2) == len(a):
+            fd = max(abs(x - y) for x, y in zip(a, c2)) / scale
+    print(f"  {cf.name[8:-9]}: arms differ {d:.3e}" +
+          (f" | determinism floor {fd:.3e}" + ("  <- at/below the floor" if fd and d <= fd * 1.5 else "")
+           if fd is not None else ""))
     worst = max(worst, d); n += 1
 print(f"  -> {n} cases, worst {worst:.3e}", "OK" if worst < 1e-4 else "*** EXCEEDS 1e-4 ***")
 PY
