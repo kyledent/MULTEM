@@ -24,6 +24,7 @@
 #endif// _MSC_VER
 
 #include "phase_timer.hpp"
+#include "host_par_sort.hpp"
 #include <numeric>
 #include <algorithm>
 
@@ -671,6 +672,72 @@ namespace mt
 				//auto last = thrust::make_zip_iterator(thrust::make_tuple(Z.end(), x.end(), y.end(), z.end(), sigma.end(), occ.end(), region.end(), charge.end()));
 
 				thrust::sort_by_key(z.begin(), z.end(), first);
+			}
+
+			// sort_by_z on nthreads host threads -- the same order, element for element (see
+			// host_par_sort.hpp). Small inputs, and any too large for 32-bit indices, take the
+			// sequential path.
+			void sort_by_z_parallel(int nthreads)
+			{
+				const size_type n = size();
+				if(nthreads < 2 || n < (size_type(1) << 16) || n >= (size_type(1) << 32))
+				{
+					sort_by_z();
+					return;
+				}
+				auto perm = host_stable_sort_permutation(&z[0], n, nthreads);
+
+				// Apply it through a packed copy, one record per atom: each scattered read then fetches
+				// all eight fields from one cache line, where permuting field by field made eight
+				// scattered reads per atom -- which on unsorted input cost more than the sort itself.
+				PhaseTimer _t("  sort: permute 8 fields");
+				struct Rec { int Z; T x, y, z; float sigma, occ; int region, charge; };
+				std::unique_ptr<Rec[]> rec(new Rec[n]);
+				int *pZ = &Z[0], *pregion = &region[0], *pcharge = &charge[0];
+				T *px = &x[0], *py = &y[0], *pz = &z[0];
+				float *psigma = &sigma[0], *pocc = &occ[0];
+				const uint32_t *pp = perm.get();
+
+				host_parallel_for(nthreads, [&](int t)
+				{
+					for(size_type j = n*t/nthreads; j < n*(t + 1)/nthreads; j++)
+					{
+						rec[j] = Rec{pZ[j], px[j], py[j], pz[j], psigma[j], pocc[j], pregion[j], pcharge[j]};
+					}
+				});
+				// reads come only from rec, so the fields can be written in place
+				host_parallel_for(nthreads, [&](int t)
+				{
+					for(size_type j = n*t/nthreads; j < n*(t + 1)/nthreads; j++)
+					{
+						const Rec &r = rec[pp[j]];
+						pZ[j] = r.Z; px[j] = r.x; py[j] = r.y; pz[j] = r.z;
+						psigma[j] = r.sigma; pocc[j] = r.occ; pregion[j] = r.region; pcharge[j] = r.charge;
+					}
+				});
+			}
+
+			// MULTEM_SORT_CHECK=1: sort a copy the sequential way and this one the parallel way, and
+			// count the atoms that differ in any bit of any field. Zero means identical.
+			size_type sort_by_z_check(int nthreads)
+			{
+				Atom_Data<T> ref;
+				ref.Z = Z; ref.x = x; ref.y = y; ref.z = z;
+				ref.sigma = sigma; ref.occ = occ; ref.region = region; ref.charge = charge;
+				ref.sort_by_z();
+				sort_by_z_parallel(nthreads);
+
+				auto same = [](const void *a, const void *b, std::size_t s){ return std::memcmp(a, b, s) == 0; };
+				size_type n_diff = 0;
+				for(size_type i = 0; i < size(); i++)
+				{
+					const bool ok = same(&Z[i], &ref.Z[i], sizeof(Z[i])) && same(&x[i], &ref.x[i], sizeof(x[i]))
+						&& same(&y[i], &ref.y[i], sizeof(y[i])) && same(&z[i], &ref.z[i], sizeof(z[i]))
+						&& same(&sigma[i], &ref.sigma[i], sizeof(sigma[i])) && same(&occ[i], &ref.occ[i], sizeof(occ[i]))
+						&& same(&region[i], &ref.region[i], sizeof(region[i])) && same(&charge[i], &ref.charge[i], sizeof(charge[i]));
+					n_diff += ok ? 0 : 1;
+				}
+				return n_diff;
 			}
 
 			// max z value within a region

@@ -63,7 +63,7 @@ namespace mt
 				{ mt::PhaseTimer _t("atoms_u.set_atoms"); 
 				atoms_u.set_atoms(input_multislice->atoms, input_multislice->grid_2d.pbc_xy, &atom_type); }
 				{ mt::PhaseTimer _t("atoms_u.sort_by_z");
-				atoms_u.sort_by_z(); }
+				sort_atoms_by_z(atoms_u); }
 
 				/***************************************************************************/
 				{ mt::PhaseTimer _t("slicing.set_input_data");
@@ -104,6 +104,29 @@ namespace mt
 				slicing.calculate(); }
 			}
 
+			// Sort by z. MULTEM_PAR_SORT=1 sorts on host threads, in the same order as the sequential
+			// sort (host_par_sort.hpp); MULTEM_SORT_CHECK=1 runs both and reports any difference.
+			void sort_atoms_by_z(Atom_Data<T> &a)
+			{
+				const char *par = std::getenv("MULTEM_PAR_SORT");
+				const char *check = std::getenv("MULTEM_SORT_CHECK");
+				if(check && check[0] == '1')
+				{
+					const int nt = mt::host_sort_threads();
+					const auto n_diff = a.sort_by_z_check(nt);
+					fprintf(stderr, "  [check] sort_by_z: %zu atoms, %d threads, %zu differ from the sequential sort\n",
+						static_cast<size_t>(a.size()), nt, static_cast<size_t>(n_diff));
+				}
+				else if(par && par[0] == '1')
+				{
+					a.sort_by_z_parallel(mt::host_sort_threads());
+				}
+				else
+				{
+					a.sort_by_z();
+				}
+			}
+
 			/* Move atoms (cgpu_rand distribution will be included in the future) */
 			void move_atoms(const int &fp_iconf)
 			{
@@ -139,7 +162,7 @@ namespace mt
 
 				if(input_multislice->pn_dim.z)
 				{
-					atoms.sort_by_z();
+					sort_atoms_by_z(atoms);
 				}
 
 				// get atom information

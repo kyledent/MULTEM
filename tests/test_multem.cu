@@ -22,12 +22,14 @@
  *   See CMakeLists.txt in multem/tests/
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -213,6 +215,15 @@ RunResult run_test(
     build_si110_specimen(tc.n_cells_x, tc.n_cells_y, tc.n_cells_z,
                          atoms, lx, ly, lz);
 
+    // MULTEM_TEST_SHUFFLE=1: present the atoms in a fixed pseudo-random order instead of the
+    // generated z-major one. Nearly-sorted input flatters any sort that adapts to its input, and a
+    // specimen read from a model file is not nearly sorted. Same atoms and seed on every run.
+    const char *shuffle = std::getenv("MULTEM_TEST_SHUFFLE");
+    const bool shuffled = shuffle && shuffle[0] == '1';
+    if (shuffled) {
+        std::shuffle(atoms.begin(), atoms.end(), std::mt19937_64(12345));
+    }
+
     result.n_atoms = atoms.size();
     result.nx = tc.nx;
     result.ny = tc.ny;
@@ -220,7 +231,7 @@ RunResult run_test(
 
     printf("  Test: %s\n", tc.name);
     printf("  Grid: %d x %d\n", tc.nx, tc.ny);
-    printf("  Atoms: %zu\n", atoms.size());
+    printf("  Atoms: %zu (%s order)\n", atoms.size(), shuffled ? "shuffled" : "generated z-major");
     printf("  Specimen: %.1f x %.1f x %.1f A\n", lx, ly, lz);
     printf("  Slices: ~%d (dz=%.1f A)\n", result.n_slices_approx, tc.spec_dz);
     printf("  Device: %s, Precision: %s\n", device.c_str(), precision.c_str());
