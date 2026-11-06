@@ -248,10 +248,16 @@ namespace mt
 				// Pipelined slice loop for GPU device.
 				// Overlaps projected potential computation for slice N+1
 				// with FFT propagation and output processing of slice N.
-				// Only when: GPU device, multislice mode, no slice caching.
+				// Only when: GPU device, multislice mode, no slice caching, and nothing that
+				// Transmission_Function::trans(islice, ...) adds after the atomic potential: an
+				// external potential function (e.g. a caller's ice model) or a static B factor.
+				// This loop computes the atomic potential directly, so with either set it would
+				// silently drop them; those cases take the original loop below.
 				if (dev == e_device && nslices > 0
 					&& this->input_multislice->is_multislice()
-					&& !this->input_multislice->slice_storage)
+					&& !this->input_multislice->slice_storage
+					&& this->potential_function == nullptr
+					&& !(this->input_multislice->static_B_factor > 0))
 				{
 					// Pre-compute first slice's projected potential
 					Projected_Potential<T, dev>::operator()(0, this->V_0);
