@@ -104,7 +104,7 @@ namespace mt
 
 		Output_Multislice() : Input_Multislice<T_r>(), output_type(eTEMOT_m2psi_tot),
 		ndetector(0), nx(0), ny(0), dx(0), dy(0), dr(0), n_thk(0), n_thk_d(0),
-		staging_pinned_(false) {}
+		pinned_psi_zh_(nullptr), pinned_m2psi_zh_(nullptr) {}
 
 		// Destructor — unpin staging buffers before thrust frees them
 		~Output_Multislice()
@@ -448,6 +448,9 @@ namespace mt
 
 			if(bb_is_device)
 			{
+				// a resize may move the buffers: never free registered memory
+				unpin_staging_buffers();
+
 				psi_zh.resize(nxy_g);
 				m2psi_zh.resize(nxy_g);
 
@@ -1208,47 +1211,62 @@ namespace mt
 	private:
 		Vector<T_c, e_host> psi_zh;
 		Vector<T_r, e_host> m2psi_zh;
-		bool staging_pinned_;
+		// the addresses registered with cudaHostRegister, or nullptr
+		void *pinned_psi_zh_;
+		void *pinned_m2psi_zh_;
 
 		// Pin/unpin staging buffers for direct DMA D2H transfers.
 		// cudaHostRegister pins existing pageable memory in-place so that
 		// subsequent cudaMemcpy (via thrust::assign) bypasses the driver's
 		// internal staging buffer, roughly doubling PCIe bandwidth.
+		//
+		// Registered memory must be unregistered before it is freed: freed memory that is still
+		// registered makes later copies from whatever is allocated there fail ("invalid argument"),
+		// so a second simulation in the same process fails. Each buffer's registration is therefore
+		// tracked by the address registered, not by its size -- clean_temporal() clears the buffers
+		// without freeing them -- and a failed registration only leaves that buffer pageable.
+		template <class TVector>
+		void pin_staging_buffer(TVector &buffer, void *&pinned)
+		{
+			void *data = thrust::raw_pointer_cast(buffer.data());
+			if ((pinned != nullptr) && (pinned == data)) return;
+			unpin_staging_buffer(buffer, pinned);
+			if (buffer.size() == 0) return;
+			cudaError_t err = cudaHostRegister(data, buffer.size() * sizeof(buffer[0]), cudaHostRegisterDefault);
+			if (err == cudaSuccess)
+			{
+				pinned = data;
+			}
+			else
+			{
+				cudaGetLastError();		// leave no error behind for the next launch check
+			}
+		}
+
+		// Unregister only memory this object registered and still holds: a copy of the object
+		// holds other buffers, and must not unregister the original's.
+		template <class TVector>
+		void unpin_staging_buffer(TVector &buffer, void *&pinned)
+		{
+			if (pinned == nullptr) return;
+			if (pinned == thrust::raw_pointer_cast(buffer.data()))
+			{
+				cudaHostUnregister(pinned);
+				cudaGetLastError();
+			}
+			pinned = nullptr;
+		}
+
 		void pin_staging_buffers()
 		{
-			if (staging_pinned_) return;
-			bool ok = true;
-			if (psi_zh.size() > 0)
-			{
-				cudaError_t err = cudaHostRegister(
-					thrust::raw_pointer_cast(psi_zh.data()),
-					psi_zh.size() * sizeof(T_c),
-					cudaHostRegisterDefault);
-				if (err != cudaSuccess) ok = false;
-			}
-			if (m2psi_zh.size() > 0)
-			{
-				cudaError_t err = cudaHostRegister(
-					thrust::raw_pointer_cast(m2psi_zh.data()),
-					m2psi_zh.size() * sizeof(T_r),
-					cudaHostRegisterDefault);
-				if (err != cudaSuccess) ok = false;
-			}
-			staging_pinned_ = ok;
+			pin_staging_buffer(psi_zh, pinned_psi_zh_);
+			pin_staging_buffer(m2psi_zh, pinned_m2psi_zh_);
 		}
 
 		void unpin_staging_buffers()
 		{
-			if (!staging_pinned_) return;
-			if (psi_zh.size() > 0)
-			{
-				cudaHostUnregister(thrust::raw_pointer_cast(psi_zh.data()));
-			}
-			if (m2psi_zh.size() > 0)
-			{
-				cudaHostUnregister(thrust::raw_pointer_cast(m2psi_zh.data()));
-			}
-			staging_pinned_ = false;
+			unpin_staging_buffer(psi_zh, pinned_psi_zh_);
+			unpin_staging_buffer(m2psi_zh, pinned_m2psi_zh_);
 		}
 
 		int n_thk;
