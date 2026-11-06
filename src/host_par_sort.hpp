@@ -31,15 +31,20 @@ namespace mt
 	// them. The result is therefore independent of the thread count, and can be checked exactly:
 	// MULTEM_SORT_CHECK=1 runs both and counts differing atoms.
 
-	// Threads this process may use: its affinity mask where the OS exposes one -- a container or
-	// batch slot given 8 of 64 cores must not start 64 threads -- else hardware_concurrency.
-	// MULTEM_SORT_THREADS overrides. The cap is a guard against oversubscription, not a tuned value.
+	// Threads the parallel host steps (sort, copy) use. MULTEM_NUM_THREADS -- or its older name
+	// MULTEM_SORT_THREADS -- sets it explicitly, uncapped. Otherwise: the process's affinity mask
+	// where the OS exposes one -- a container or batch slot given 8 of 64 cores must not start 64
+	// threads -- else hardware_concurrency, capped at 16 as a guard against oversubscription (not a
+	// tuned value; measured gains flatten beyond about 8 to 16).
 	inline int host_sort_threads()
 	{
-		if(const char *e = std::getenv("MULTEM_SORT_THREADS"))
+		for(const char *name : {"MULTEM_NUM_THREADS", "MULTEM_SORT_THREADS"})
 		{
-			const int n = std::atoi(e);
-			if(n > 0) return n;
+			if(const char *e = std::getenv(name))
+			{
+				const int n = std::atoi(e);
+				if(n > 0) return n;
+			}
 		}
 		int n = 0;
 #ifdef __linux__
