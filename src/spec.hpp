@@ -20,6 +20,7 @@
 #define SPECIMEN_H
 
 #include "phase_timer.hpp"
+#include "atom_type_cache.hpp"
 #include <climits>
 #include <memory>
 #include "math.cuh"
@@ -52,12 +53,44 @@ namespace mt
 				/***************************************************************************/
 				{
 				mt::PhaseTimer _t("atom_type tables (all 103)");
-				Atomic_Data atomic_data(input_multislice->potential_type);
 
-				atom_type.resize(c_nAtomsTypes); 
-				for(auto i = 0; i<atom_type.size(); i++)
+				// this branch has no band-limited tables, so the key's band-limit spacing is always 0
+				const double dR_bl = 0.0;
+
+				// MULTEM_ATOM_TYPE_CACHE=1: reuse the tables of an earlier call with the same inputs
+				// (atom_type_cache.hpp); MULTEM_ATOM_TYPE_CACHE_CHECK=1 rebuilds them anyway and counts
+				// any difference from the cached copy.
+				using TAtom_Types = decltype(atom_type);
+				const atom_type_cache::Key key{static_cast<int>(input_multislice->potential_type), input_multislice->Vrl,
+					input_multislice->nR, static_cast<double>(input_multislice->grid_2d.dR_min()), dR_bl};
+				const bool use_cache = atom_type_cache::enabled();
+				auto &store = atom_type_cache::Store<TAtom_Types>::instance();
+				const bool hit = use_cache && store.get(key, atom_type);
+				const bool check = hit && atom_type_cache::checking();
+
+				if(!hit || check)
 				{
-					atomic_data.To_atom_type_CPU(i+1, input_multislice->Vrl, input_multislice->nR, input_multislice->grid_2d.dR_min(), atom_type[i]);
+					// cache off: build straight into atom_type, exactly as before; otherwise build
+					// aside, then compare (check) or store and use it (miss)
+					TAtom_Types built;
+					TAtom_Types &target = use_cache ? built : atom_type;
+					Atomic_Data atomic_data(input_multislice->potential_type);
+					target.resize(c_nAtomsTypes);
+					for(auto i = 0; i<target.size(); i++)
+					{
+						atomic_data.To_atom_type_CPU(i+1, input_multislice->Vrl, input_multislice->nR, input_multislice->grid_2d.dR_min(), target[i]);
+					}
+					if(check)
+					{
+						const auto n_diff = atom_type_cache::diff_tables(built, atom_type);
+						fprintf(stderr, "  [check] atom_type cache: %zu atom types, %zu values differ from a fresh build\n",
+							static_cast<size_t>(built.size()), static_cast<size_t>(n_diff));
+					}
+					else if(use_cache)
+					{
+						store.put(key, built);
+						atom_type_cache::copy_tables(built, atom_type);
+					}
 				}
 				}
 
