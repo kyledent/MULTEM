@@ -54,10 +54,13 @@ namespace mt
 				mt::PhaseTimer _t("atom_type tables (all 103)");
 				Atomic_Data atomic_data(input_multislice->potential_type);
 
+				// MULTEM_BANDLIMITED_POTENTIAL=1: tables band-limited to this grid (bandlimited_potential.hpp)
+				const double dR_bl = (bandlimit::enabled())?bandlimit::band_spacing(input_multislice->grid_2d.dRx, input_multislice->grid_2d.dRy):0.0;
+
 				atom_type.resize(c_nAtomsTypes); 
 				for(auto i = 0; i<atom_type.size(); i++)
 				{
-					atomic_data.To_atom_type_CPU(i+1, input_multislice->Vrl, input_multislice->nR, input_multislice->grid_2d.dR_min(), atom_type[i]);
+					atomic_data.To_atom_type_CPU(i+1, input_multislice->Vrl, input_multislice->nR, input_multislice->grid_2d.dR_min(), atom_type[i], dR_bl);
 				}
 				}
 

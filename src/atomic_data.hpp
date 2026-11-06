@@ -27,6 +27,7 @@
 #include "math.cuh"
 #include "types.cuh"
 #include "atomic_fcns_mt.hpp"
+#include "bandlimited_potential.hpp"
 
 namespace mt
 {
@@ -144,8 +145,10 @@ namespace mt
 				return (Z_bound(Z))?data_table[Z-1].ra:0;
 			}
 
+			// dR_bl > 0 builds band-limited tables for a grid of that spacing (bandlimited_potential.hpp);
+			// 0 builds MULTEM's own.
 			template <class TAtom_Type>
-			void To_atom_type_CPU(int Z_i, double Vrl_i, int nR_i, double R_min_i, TAtom_Type &atom_type)
+			void To_atom_type_CPU(int Z_i, double Vrl_i, int nR_i, double R_min_i, TAtom_Type &atom_type, double dR_bl = 0)
 			{
 				using value_type = Value_type<decltype(c_atom_type)>;
 
@@ -159,7 +162,7 @@ namespace mt
 				c_atom_type.ra_c = 0.0;
 
 				R_min_i = ::fmax(c_atom_type.rn_c, R_min_i);
-				get_atom_coef(Z_i, Vrl_i, nR_i, R_min_i, c_atom_type);
+				get_atom_coef(Z_i, Vrl_i, nR_i, R_min_i, c_atom_type, dR_bl);
 
 				// ra_c and R_max
 				int charge = 0;
@@ -1544,7 +1547,7 @@ namespace mt
 
 			// get Coefficients
 			template <class TAtom_Type>
-			void get_atom_coef(int Z, double Vrl, int nR, double R_min, TAtom_Type &atom_type)		
+			void get_atom_coef(int Z, double Vrl, int nR, double R_min, TAtom_Type &atom_type, double dR_bl = 0)
 			{
 				using T = Value_type<TAtom_Type>;
 
@@ -1607,10 +1610,14 @@ namespace mt
 						coef.Vr.assign(c_Vr[i]);
 						coef.VR.assign(c_VR[i]);
 
-						coef.R_min = R_min;
+						// band-limited table (neutral atoms only): nodes from well inside a pixel, out to
+						// at least bandlimit::c_r_max_px pixels or the potential's own cutoff
+						const bool band_limited = (dR_bl > 0) && (coef.charge == 0);
+
+						coef.R_min = (band_limited)?bandlimit::c_r_min_px*dR_bl:R_min;
 						c_atom_cal.Set_Atom_Type(potential_type, coef.charge, &atom_type);
 						coef.R_max = (coef.charge == 0)?c_atom_cal.AtomicRadius_Cutoff(3, Vrl):atom_type.coef[0].R_max;
-						coef.R_max = ::fmax(coef.R_max, T(2)*R_min);
+						coef.R_max = ::fmax(coef.R_max, (band_limited)?T(bandlimit::c_r_max_px*dR_bl):T(2)*R_min);
 
 						if(isZero(coef.R_max))
 						{
@@ -1635,7 +1642,27 @@ namespace mt
 						Vector<T, e_host> dVR(nR);
 
 						c_atom_cal.Set_Atom_Type(potential_type, coef.charge, &atom_type);
-						c_atom_cal.VR_dVR(nR, coef.R.data(), VR.data(), dVR.data());
+						if(band_limited)
+						{
+							// the 2D Fourier transform of the projected potential is c_Potf f_e(q)
+							auto F = [this](double q)->double
+							{
+								double fe;
+								c_atom_cal.feg(q, fe);
+								return c_Potf*fe;
+							};
+							std::vector<double> Rd(coef.R.begin(), coef.R.end()), Vd(nR), dVd(nR);
+							bandlimit::projected_potential(F, dR_bl, nR, Rd.data(), Vd.data(), dVd.data());
+							for(auto iR = 0; iR < nR; iR++)
+							{
+								VR[iR] = Vd[iR];
+								dVR[iR] = dVd[iR];
+							}
+						}
+						else
+						{
+							c_atom_cal.VR_dVR(nR, coef.R.data(), VR.data(), dVR.data());
+						}
 
 						auto x_tap = coef.R2_tap();
 						auto tap_cf = coef.tap_cf;
@@ -1662,6 +1689,24 @@ namespace mt
 							T n = dV+dVn;
 							coef.ciVR.c2[iR] = (3.0*m-n-dV)*idR;
 							coef.ciVR.c3[iR] = (n-2.0*m)*idR*idR;
+						}
+
+						// scale a band-limited table so that its own integral is exactly c_Potf f_e(0):
+						// the grid sum of a band-limited function is its integral, and this takes up the
+						// small part of it lost to the cutoff and the taper
+						if(band_limited)
+						{
+							double fe0;
+							c_atom_cal.feg(0.0, fe0);
+							const double integral = bandlimit::table_integral(nR, coef.R2, coef.ciVR.c0, coef.ciVR.c1, coef.ciVR.c2, coef.ciVR.c3);
+							const double scale = c_Potf*fe0/integral;
+							for(auto iR = 0; iR < nR; iR++)
+							{
+								coef.ciVR.c0[iR] *= scale;
+								coef.ciVR.c1[iR] *= scale;
+								coef.ciVR.c2[iR] *= scale;
+								coef.ciVR.c3[iR] *= scale;
+							}
 						}
 					}
 				}
