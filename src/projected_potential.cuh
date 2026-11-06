@@ -291,15 +291,6 @@ namespace mt
 				auto &grid_2d = this->input_multislice->grid_2d;
 				const Atom_Vp<T> *atoms_ptr = atom_Vp_all_d + iatom_0;
 
-				// Ensure atom_tile_indices is large enough (9 tiles per atom worst case)
-				int max_overlaps = 9 * n_atoms;
-				if (max_overlaps > tile_indices_capacity)
-				{
-					if (d_atom_tile_indices) cudaFree(d_atom_tile_indices);
-					cudaMalloc(&d_atom_tile_indices, max_overlaps * sizeof(int));
-					tile_indices_capacity = max_overlaps;
-				}
-
 				// Step 1: Zero tile counts and count atom-tile overlaps
 				// All ops on async_stream[0] — CUDA stream ordering guarantees
 				// sequential execution without explicit syncs between steps.
@@ -319,6 +310,23 @@ namespace mt
 					d_cub_temp, d_cub_temp_size,
 					d_tile_counts, d_tile_offsets + 1, n_tiles,
 					async_stream[0]);
+
+				// atom_tile_indices must hold every atom-tile overlap. That is not 9 per atom at most:
+				// a window up to w px wide spans up to ceil((w - 1)/16) + 1 tiles per axis, so once
+				// cutoff radii exceed about 16 px (fine sampling) windows
+				// wider than 33 px overlap more than 3 x 3 tiles and a 9-per-atom buffer overflows.
+				// Read the exact total back from the prefix sum before scattering.
+				int n_overlaps = 0;
+				cudaMemcpyAsync(&n_overlaps, d_tile_offsets + n_tiles, sizeof(int),
+					cudaMemcpyDeviceToHost, async_stream[0]);
+				cudaStreamSynchronize(async_stream[0]);
+				if (n_overlaps > tile_indices_capacity)
+				{
+					const int capacity = n_overlaps + n_overlaps/4;
+					if (d_atom_tile_indices) cudaFree(d_atom_tile_indices);
+					cudaMalloc(&d_atom_tile_indices, capacity * sizeof(int));
+					tile_indices_capacity = capacity;
+				}
 
 				// Step 3: Zero write positions, scatter atom indices
 				cudaMemsetAsync(d_tile_write_pos, 0, n_tiles * sizeof(int), async_stream[0]);
